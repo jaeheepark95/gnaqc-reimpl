@@ -303,9 +303,10 @@ def _train_single_backend(
                     ).max(dim=1).values
 
                 q_target = batch["rewards"] + cfg.gamma * q_next * (1 - batch["dones"])
-                loss = F.mse_loss(q_current, q_target)
+                loss = F.smooth_l1_loss(q_current, q_target)  # Huber loss: robust to large Q-value errors
                 optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # prevent gradient explosion
                 optimizer.step()
                 episode_loss = loss.item()
 
