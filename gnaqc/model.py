@@ -85,8 +85,17 @@ class GNAQCNetwork(nn.Module):
         )
 
         # --- State path (Fig.7: state vector gets its own Dense layer) ---
+        # Mapping vector entries are discrete qubit IDs in {-1, 0, ..., N-1}
+        # (-1 = unassigned). Feeding them raw to nn.Linear(N, ...) leaks the
+        # index magnitude as a spurious scalar feature (values up to N-1=52
+        # on Rochester, dominating the L2-normalized 14-dim backend path).
+        # Use a small embedding table instead: each physical slot looks up
+        # an embedding for its assigned logical qubit (or a dedicated
+        # "unassigned" embedding at index 0), then flatten to (N*emb_dim).
+        self.state_embed_dim = max(4, cfg.state_hidden // N)
+        self.state_embedding = nn.Embedding(N + 1, self.state_embed_dim)
         self.state_dense = nn.Sequential(
-            nn.Linear(N, cfg.state_hidden),
+            nn.Linear(N * self.state_embed_dim, cfg.state_hidden),
             nn.ReLU(),
         )
 
@@ -135,8 +144,10 @@ class GNAQCNetwork(nn.Module):
         circuit_flat = circuit_features.reshape(batch_size, -1)
         circuit_repr = self.circuit_dense(circuit_flat)
 
-        # State path
-        state_repr = self.state_dense(state_vector)
+        # State path: shift -1 -> 0 (unassigned), 0..N-1 -> 1..N.
+        state_ids = (state_vector.long() + 1).clamp_(min=0, max=self.num_physical)
+        state_emb = self.state_embedding(state_ids)             # (B, N, emb_dim)
+        state_repr = self.state_dense(state_emb.reshape(batch_size, -1))
 
         # Combined
         combined = torch.cat([backend_flat, circuit_repr, state_repr], dim=-1)

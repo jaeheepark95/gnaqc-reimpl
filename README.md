@@ -167,7 +167,7 @@ circuits/                   # 25 Pozzi benchmark QASM files (original, non-norma
 ## Implementation Details
 
 ### Backend Features (14-dim, Table 1)
-SX/X/ID gate error and length, readout error, T1, T2, frequency (scaled to GHz), measurement length, CNOT error/length (node-averaged from edges), readout length. Row-normalized (L2) per the paper.
+Paper-faithful order: `[E_ID, L_ID, E_RZ, L_RZ, E_SX, L_SX, E_X, L_X, T1, T2, F, E_M, P_01, P_10]`. Per-qubit 1Q gate error/length for ID/RZ/SX/X, relaxation/dephasing times, frequency (GHz), aggregate measurement error `E_M`, and asymmetric readout assignment errors `P_01 = P(meas 1 | prep 0)`, `P_10 = P(meas 0 | prep 1)` — read from `backend.properties().qubit_property('prob_meas1_prep0' / 'prob_meas0_prep1')`. RZ slots are genuinely 0 on IBM HW (virtual frame-change gate). Row-normalized (L2) per the paper.
 
 ### Edge Matrix (N×N)
 CNOT error rates, **doubly-stochastic** normalized via Sinkhorn-Knopp. Self-loops added before normalization (standard GCN practice `Ã = A + I`) to ensure convergence on sparse coupling maps.
@@ -199,9 +199,9 @@ Some benchmark QASM files declare a classical register but emit no `measure` ins
 | Aspect | Paper | This Implementation | Reason |
 |--------|-------|---------------------|--------|
 | Framework | TensorFlow | PyTorch | Ecosystem preference |
-| Invalid actions | 0 reward | Action masking (-inf) | Faster convergence |
+| Invalid actions | 0 reward | Action masking (-inf), also excludes ancilla logical indices | Faster convergence; action space stays `real_logical × physical` per paper |
 | Mapping vector init | 0 (unassigned) | -1 (unassigned) | Avoid conflict with qubit index 0 |
-| RZ gate features (Table 1 slots) | Unclear | Replaced by CNOT error/length (node-avg) | RZ is virtual gate on IBM HW (always 0 error/duration) |
+| State-vector encoding | Raw integer IDs into Dense | `nn.Embedding(N+1, d)` lookup, then Dense | Raw IDs leak O(N) magnitude (up to 52 on Rochester) into feature fusion vs. L2-normalized 14-dim node features |
 | DQN loss | Not specified (likely MSE) | **Huber + grad clip** | Empirically required to prevent Q-value divergence |
 | Ideal simulation | Every terminal step | Cached per circuit | Layout/noise-independent; 50%+ training speedup |
 | Calibration data | 150 daily snapshots (real IBM) | FakeBackendV2 + **±30%/±20%/±10% perturbation** | No access to historical calibration archive |

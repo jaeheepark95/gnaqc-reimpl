@@ -30,14 +30,21 @@ from gnaqc.backend import get_two_qubit_gate_name
 def extract_backend_node_features(backend) -> np.ndarray:
     """Extract 14-dim node features per physical qubit (Table 1).
 
-    Features:
-        0: SX gate error         1: SX gate length
-        2: X gate error          3: X gate length
-        4: Readout error         5: T1
-        6: T2                    7: Frequency (scaled to GHz)
-        8: ID gate error         9: ID gate length
-       10: Measurement length   11: CNOT error (node avg)
-       12: CNOT length (node avg) 13: Readout length
+    Paper Table 1 (LeCompte et al., IEEE TQE 2023):
+         0: E_ID  (identity gate error)      1: L_ID  (identity gate length)
+         2: E_RZ (RZ gate error)             3: L_RZ (RZ gate length)
+         4: E_SX (SX gate error)             5: L_SX (SX gate length)
+         6: E_X  (X gate error)              7: L_X  (X gate length)
+         8: T1   (relaxation time)           9: T2   (dephasing time)
+        10: F    (qubit frequency, GHz)     11: E_M  (measurement error)
+        12: P_01 (P(meas 1 | prep 0))       13: P_10 (P(meas 0 | prep 1))
+
+    Note: RZ is a virtual (frame-change) gate on IBM HW — error and duration
+    are genuinely 0 in the backend Target. Reading them directly yields the
+    paper's intended value (rather than substituting from other gates).
+
+    P_01 / P_10 are the asymmetric readout assignment errors, read from
+    backend.properties() (qubit_property 'prob_meas1_prep0' / 'prob_meas0_prep1').
 
     Args:
         backend: FakeBackendV2 instance.
@@ -47,79 +54,55 @@ def extract_backend_node_features(backend) -> np.ndarray:
     """
     target = backend.target
     num_qubits = target.num_qubits
+    props = backend.properties()
 
     features = np.zeros((num_qubits, 14), dtype=np.float64)
 
-    # Get 2Q gate name for this backend (cx, ecr, or cz)
-    gate_2q = get_two_qubit_gate_name(backend)
-
-    # Precompute per-node CNOT error/duration averages from edges
-    cx_props = target[gate_2q]
-    node_cx_errors: dict[int, list[float]] = {q: [] for q in range(num_qubits)}
-    node_cx_durations: dict[int, list[float]] = {q: [] for q in range(num_qubits)}
-    for qargs, props in cx_props.items():
-        if props is None:
-            continue
-        a, b = qargs
-        error = props.error if props.error is not None else 0.0
-        duration = props.duration if props.duration is not None else 0.0
-        node_cx_errors[a].append(error)
-        node_cx_errors[b].append(error)
-        node_cx_durations[a].append(duration)
-        node_cx_durations[b].append(duration)
+    # Table 1 column layout: (feature_index, qiskit_gate_name)
+    gate_slots = [
+        (0, 1, "id"),
+        (2, 3, "rz"),
+        (4, 5, "sx"),
+        (6, 7, "x"),
+    ]
 
     for q in range(num_qubits):
         qp = target.qubit_properties[q]
 
-        # SX gate (0, 1)
-        if "sx" in target.operation_names and (q,) in target["sx"]:
-            sx_props = target["sx"][(q,)]
-            if sx_props is not None:
-                features[q, 0] = sx_props.error or 0.0
-                features[q, 1] = sx_props.duration or 0.0
+        # Per-qubit 1Q gates: E_* and L_*
+        for err_col, len_col, gname in gate_slots:
+            if gname in target.operation_names and (q,) in target[gname]:
+                gp = target[gname][(q,)]
+                if gp is not None:
+                    features[q, err_col] = gp.error or 0.0
+                    features[q, len_col] = gp.duration or 0.0
 
-        # X gate (2, 3)
-        if "x" in target.operation_names and (q,) in target["x"]:
-            x_props = target["x"][(q,)]
-            if x_props is not None:
-                features[q, 2] = x_props.error or 0.0
-                features[q, 3] = x_props.duration or 0.0
+        # T1 (8), T2 (9)
+        features[q, 8] = qp.t1 if qp.t1 is not None else 0.0
+        features[q, 9] = qp.t2 if qp.t2 is not None else 0.0
 
-        # Readout error (4)
-        if "measure" in target.operation_names and (q,) in target["measure"]:
-            m_props = target["measure"][(q,)]
-            if m_props is not None:
-                features[q, 4] = m_props.error or 0.0
-
-        # T1 (5), T2 (6)
-        features[q, 5] = qp.t1 if qp.t1 is not None else 0.0
-        features[q, 6] = qp.t2 if qp.t2 is not None else 0.0
-
-        # Frequency (7) — scale from Hz to GHz
+        # Frequency in GHz (10)
         freq = qp.frequency if qp.frequency is not None else 0.0
-        features[q, 7] = freq * 1e-9  # Hz -> GHz
+        features[q, 10] = freq * 1e-9
 
-        # ID gate (8, 9)
-        if "id" in target.operation_names and (q,) in target["id"]:
-            id_props = target["id"][(q,)]
-            if id_props is not None:
-                features[q, 8] = id_props.error or 0.0
-                features[q, 9] = id_props.duration or 0.0
-
-        # Measurement length (10)
+        # E_M — aggregate measurement error (11)
         if "measure" in target.operation_names and (q,) in target["measure"]:
             m_props = target["measure"][(q,)]
             if m_props is not None:
-                features[q, 10] = m_props.duration or 0.0
+                features[q, 11] = m_props.error or 0.0
 
-        # CNOT error avg (11), CNOT length avg (12)
-        if node_cx_errors[q]:
-            features[q, 11] = np.mean(node_cx_errors[q])
-        if node_cx_durations[q]:
-            features[q, 12] = np.mean(node_cx_durations[q])
-
-        # Readout length (13)
-        features[q, 13] = features[q, 10]
+        # P_01, P_10 — asymmetric readout assignment errors (12, 13)
+        if props is not None:
+            try:
+                p01 = props.qubit_property(q, "prob_meas1_prep0")
+                features[q, 12] = p01[0] if isinstance(p01, tuple) else p01
+            except Exception:
+                features[q, 12] = 0.0
+            try:
+                p10 = props.qubit_property(q, "prob_meas0_prep1")
+                features[q, 13] = p10[0] if isinstance(p10, tuple) else p10
+            except Exception:
+                features[q, 13] = 0.0
 
     # Row normalization (paper: "normalize the matrix by row to accelerate convergence")
     features = _row_normalize(features)
@@ -221,7 +204,14 @@ def get_intermediate_circuit(circuit: QuantumCircuit, backend) -> QuantumCircuit
     Paper Section IV-B: "We do not use the original logical circuit...
     Instead, we acquire the intermediate circuit during the compilation process
     at the point where qubit mapping normally occurs."
+
+    Measurements are appended here (when absent) so Table 2's M feature
+    reflects the circuit actually simulated — many benchmark QASMs declare
+    a creg without emitting measure instructions.
     """
+    from gnaqc.environment import ensure_measurements
+    circuit = ensure_measurements(circuit)
+
     basis_gates = backend.configuration().basis_gates
 
     pm = PassManager()

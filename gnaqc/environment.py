@@ -18,7 +18,9 @@ References:
 
 from __future__ import annotations
 
-from typing import Any
+import signal
+from contextlib import contextmanager
+from typing import Any, Callable, TypeVar
 
 import numpy as np
 import torch
@@ -34,6 +36,39 @@ from gnaqc.features import (
 from gnaqc.fidelity import compute_hellinger_fidelity
 from gnaqc.noise_perturbation import perturb_backend_noise
 from gnaqc.simulator import create_ideal_simulator, create_noisy_simulator
+
+
+_T = TypeVar("_T")
+
+
+class _SimTimeoutError(TimeoutError):
+    """Raised by run_with_signal_timeout when the wall-clock budget is exceeded."""
+
+
+@contextmanager
+def _signal_timeout(seconds: int):
+    """SIGALRM-based timeout. Single-threaded, leak-free.
+
+    Limitations: Linux/Unix only; only the main thread can set signal handlers,
+    so this must not be wrapped around code running in worker threads. The
+    handler raises _SimTimeoutError; C extensions that hold the GIL without
+    releasing it will not be interrupted until they yield back to Python, but
+    cuQuantum/Aer release the GIL during long contractions.
+    """
+    def _handler(signum, frame):
+        raise _SimTimeoutError(f"operation exceeded {seconds}s")
+
+    if seconds <= 0:
+        yield
+        return
+
+    old_handler = signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 
 def ensure_measurements(circuit: QuantumCircuit) -> QuantumCircuit:
@@ -130,23 +165,35 @@ class QubitAllocationEnv:
 
     def _get_ideal_counts(
         self, circuit: QuantumCircuit, backend_name: str
-    ) -> dict[str, int]:
-        """Cached ideal counts (noise-independent). Computed once per circuit."""
+    ) -> dict[str, int] | None:
+        """Cached ideal counts (noise-independent). Computed once per circuit.
+
+        Returns None if the ideal simulation times out or raises — caller is
+        expected to mark the episode crashed and skip.
+        """
         cache_key = f"{circuit.name}_{backend_name}"
-        if cache_key not in self._ideal_cache:
-            ideal_sim = self._get_ideal_sim(backend_name)
+        if cache_key in self._ideal_cache:
+            return self._ideal_cache[cache_key]
 
-            meas_circuit = ensure_measurements(circuit)
+        ideal_sim = self._get_ideal_sim(backend_name)
+        meas_circuit = ensure_measurements(circuit)
+        compiled = transpile(
+            meas_circuit,
+            backend=self.base_backend,
+            optimization_level=0,
+            seed_transpiler=self.cfg.seed_transpiler,
+        )
 
-            compiled = transpile(
-                meas_circuit,
-                backend=self.base_backend,
-                optimization_level=0,
-                seed_transpiler=self.cfg.seed_transpiler,
-            )
-            result = ideal_sim.run(compiled, shots=self.cfg.train_shots).result()
-            self._ideal_cache[cache_key] = result.get_counts()
-        return self._ideal_cache[cache_key]
+        try:
+            with _signal_timeout(int(self.cfg.train_sim_timeout_s)):
+                counts = ideal_sim.run(
+                    compiled, shots=self.cfg.train_shots
+                ).result().get_counts()
+        except Exception:
+            return None
+
+        self._ideal_cache[cache_key] = counts
+        return counts
 
     # -----------------------------------------------------------------
     # Gym-like interface
@@ -190,8 +237,21 @@ class QubitAllocationEnv:
             (self.num_physical,), -1.0, dtype=torch.float32, device=self.device
         )
 
-        # Pre-cache ideal simulation (noise-independent)
-        self._get_ideal_counts(intermediate, backend_name)
+        # Pre-cache ideal simulation (noise-independent). If it hangs or fails,
+        # mark the episode crashed so the train loop skips it (the while-loop
+        # body is guarded by `not env.done`, so setting done=True aborts it).
+        if self._get_ideal_counts(intermediate, backend_name) is None:
+            self.crashed = True
+            self.done = True
+            self.crash_info = {
+                "backend": self.backend_name,
+                "num_logical": self.num_logical,
+                "num_physical": self.num_physical,
+                "layout": None,
+                "error_type": "IdealSimTimeout",
+                "error": f"ideal_sim exceeded {self.cfg.train_sim_timeout_s}s "
+                         f"or raised (circuit={circuit.name})",
+            }
 
         return self._get_state()
 
@@ -258,15 +318,29 @@ class QubitAllocationEnv:
             seed_transpiler=self.cfg.seed_transpiler,
         )
 
+        # Wall-clock timeout via SIGALRM: cuTensorNet's contractor autotuner can
+        # occasionally pick a path that runs for many minutes without raising.
+        # We'd rather skip those episodes than hang the whole training.
         try:
-            noisy_counts = self.noisy_sim.run(
-                compiled, shots=self.cfg.train_shots
-            ).result().get_counts()
+            with _signal_timeout(int(self.cfg.train_sim_timeout_s)):
+                noisy_counts = self.noisy_sim.run(
+                    compiled, shots=self.cfg.train_shots
+                ).result().get_counts()
+        except _SimTimeoutError:
+            self.crashed = True
+            self.crash_info = {
+                "backend": self.backend_name,
+                "num_logical": self.num_logical,
+                "num_physical": self.num_physical,
+                "layout": list(layout_list),
+                "error_type": "TimeoutError",
+                "error": f"noisy_sim exceeded {self.cfg.train_sim_timeout_s}s",
+            }
+            return 0.0
         except Exception as e:
             # cuTensorNet occasionally fails with CUTENSORNET_STATUS_INVALID_VALUE
-            # on specific (circuit, layout) combinations. Mark the episode as
-            # crashed so the training loop can skip it instead of learning from
-            # a fabricated reward.
+            # on specific (circuit, layout) combinations. Skip the episode
+            # instead of learning from a fabricated reward.
             self.crashed = True
             self.crash_info = {
                 "backend": self.backend_name,
@@ -279,23 +353,48 @@ class QubitAllocationEnv:
             return 0.0
 
         ideal_counts = self._get_ideal_counts(self.circuit, self.backend_name)
+        if ideal_counts is None:
+            # Defensive: reset() pre-caches ideal counts and aborts the episode
+            # on failure, so this branch should not be reachable. Guard against
+            # future cache-policy changes (e.g. eviction) that could re-trigger
+            # an ideal sim here and return None.
+            self.crashed = True
+            self.crash_info = {
+                "backend": self.backend_name,
+                "num_logical": self.num_logical,
+                "num_physical": self.num_physical,
+                "layout": list(layout_list),
+                "error_type": "IdealSimUnavailable",
+                "error": "ideal_counts cache miss + recompute failed",
+            }
+            return 0.0
         fidelity = compute_hellinger_fidelity(ideal_counts, noisy_counts)
         return fidelity * self.cfg.terminal_reward_scale
 
     def invalid_action_mask(self) -> torch.Tensor:
+        """Mask invalid actions in the N*N action grid.
+
+        Invalid = logical already placed, physical already occupied, or
+        logical_idx >= num_logical (ancilla indices are not valid actions
+        per the paper's formulation: action space is real_logical x physical).
+        """
         N = self.num_physical
         mask = torch.zeros(N * N, dtype=torch.bool, device=self.device)
         for action_idx in range(N * N):
             logical_idx = action_idx // N
             physical_idx = action_idx % N
-            if logical_idx in self.placed_logical or physical_idx in self.placed_physical:
+            if (
+                logical_idx >= self.num_logical
+                or logical_idx in self.placed_logical
+                or physical_idx in self.placed_physical
+            ):
                 mask[action_idx] = True
         return mask
 
     def valid_actions(self) -> list[int]:
         N = self.num_physical
         valid = []
-        unplaced_logical = set(range(N)) - self.placed_logical
+        unplaced_logical = set(range(self.num_logical)) - self.placed_logical
         unoccupied_physical = set(range(N)) - self.placed_physical
         for l_idx in unplaced_logical:
             for p_idx in unoccupied_physical:

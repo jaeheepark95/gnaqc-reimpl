@@ -39,6 +39,11 @@ class GNAQCConfig:
     # Training uses fewer shots for speed; evaluation uses more for accuracy.
     train_shots: int = 1000             # fast noise-reward estimation during RL
     eval_shots: int = 8192              # aligned with GraphQMap for fair comparison
+    # Abort a noisy-sim call if it exceeds this wall-clock budget. Typical
+    # tensor-network sims finish in <15s on 27Q toronto; 120s is a safety
+    # margin for the pathological-contraction-path case where cuTensorNet's
+    # autotuner picks a plan that runs for many minutes without crashing.
+    train_sim_timeout_s: float = 120.0
     routing_method: str = "sabre"       # [paper] Qiskit default routing
     seed_transpiler: int = 42           # deterministic routing for reproducibility
 
