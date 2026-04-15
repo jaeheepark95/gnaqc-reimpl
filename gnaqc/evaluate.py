@@ -24,7 +24,7 @@ from qiskit import QuantumCircuit, transpile
 
 from gnaqc.backend import get_backend
 from gnaqc.config import GNAQCConfig
-from gnaqc.environment import QubitAllocationEnv
+from gnaqc.environment import QubitAllocationEnv, ensure_measurements
 from gnaqc.fidelity import compute_hellinger_fidelity, compute_pst
 from gnaqc.model import GNAQCNetwork
 from gnaqc.simulator import create_ideal_simulator, create_noisy_simulator
@@ -66,9 +66,7 @@ def evaluate_gnaqc_layout(
             layout_list[logical_idx] = phys_idx
 
     # Compute fidelity
-    meas_circuit = env.circuit.copy()
-    if meas_circuit.num_clbits == 0:
-        meas_circuit.measure_all()
+    meas_circuit = ensure_measurements(env.circuit)
 
     compiled = transpile(
         meas_circuit, backend=backend, initial_layout=layout_list,
@@ -103,9 +101,7 @@ def evaluate_baseline_layout(
     cfg: GNAQCConfig,
 ) -> dict:
     """Evaluate a Qiskit baseline layout method."""
-    meas_circuit = circuit.copy()
-    if meas_circuit.num_clbits == 0:
-        meas_circuit.measure_all()
+    meas_circuit = ensure_measurements(circuit)
 
     compiled = transpile(
         meas_circuit, backend=backend, layout_method=layout_method,

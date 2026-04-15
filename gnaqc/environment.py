@@ -36,6 +36,24 @@ from gnaqc.noise_perturbation import perturb_backend_noise
 from gnaqc.simulator import create_ideal_simulator, create_noisy_simulator
 
 
+def ensure_measurements(circuit: QuantumCircuit) -> QuantumCircuit:
+    """Return a copy with measurements appended if the circuit has none.
+
+    Checks for actual Measure instructions, not just the presence of a classical
+    register — some benchmark QASM files declare `creg` but never measure.
+    """
+    has_measure = any(
+        instr.operation.name == "measure" for instr in circuit.data
+    )
+    if has_measure:
+        return circuit.copy()
+    qc = circuit.copy()
+    # Drop any empty classical registers that aren't used (measure_all adds a new one)
+    qc.remove_final_measurements(inplace=True)
+    qc.measure_all()
+    return qc
+
+
 class QubitAllocationEnv:
     """RL environment for sequential qubit placement.
 
@@ -113,9 +131,7 @@ class QubitAllocationEnv:
         if cache_key not in self._ideal_cache:
             ideal_sim = self._get_ideal_sim(backend_name)
 
-            meas_circuit = circuit.copy()
-            if meas_circuit.num_clbits == 0:
-                meas_circuit.measure_all()
+            meas_circuit = ensure_measurements(circuit)
 
             compiled = transpile(
                 meas_circuit,
@@ -224,9 +240,7 @@ class QubitAllocationEnv:
         if any(p is None for p in layout_list):
             return 0.0
 
-        meas_circuit = self.circuit.copy()
-        if meas_circuit.num_clbits == 0:
-            meas_circuit.measure_all()
+        meas_circuit = ensure_measurements(self.circuit)
 
         compiled = transpile(
             meas_circuit,
