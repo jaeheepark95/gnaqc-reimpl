@@ -94,6 +94,11 @@ class QubitAllocationEnv:
         self.placed_logical: set[int] = set()
         self.placed_physical: set[int] = set()
         self.done: bool = False
+        # Set by step() if the terminal noisy simulation raised (e.g. cuTensorNet
+        # contractor returning CUTENSORNET_STATUS_INVALID_VALUE). Train loop uses
+        # this to skip the episode instead of polluting replay with reward=0.
+        self.crashed: bool = False
+        self.crash_info: dict[str, Any] | None = None
 
     # -----------------------------------------------------------------
     # Per-episode backend preparation
@@ -161,6 +166,8 @@ class QubitAllocationEnv:
         self.base_backend = backend
         self.backend_name = backend_name
         self.done = False
+        self.crashed = False
+        self.crash_info = None
         self.placed_logical = set()
         self.placed_physical = set()
 
@@ -251,9 +258,25 @@ class QubitAllocationEnv:
             seed_transpiler=self.cfg.seed_transpiler,
         )
 
-        noisy_counts = self.noisy_sim.run(
-            compiled, shots=self.cfg.train_shots
-        ).result().get_counts()
+        try:
+            noisy_counts = self.noisy_sim.run(
+                compiled, shots=self.cfg.train_shots
+            ).result().get_counts()
+        except Exception as e:
+            # cuTensorNet occasionally fails with CUTENSORNET_STATUS_INVALID_VALUE
+            # on specific (circuit, layout) combinations. Mark the episode as
+            # crashed so the training loop can skip it instead of learning from
+            # a fabricated reward.
+            self.crashed = True
+            self.crash_info = {
+                "backend": self.backend_name,
+                "num_logical": self.num_logical,
+                "num_physical": self.num_physical,
+                "layout": list(layout_list),
+                "error_type": type(e).__name__,
+                "error": str(e).splitlines()[0][:200] if str(e) else "",
+            }
+            return 0.0
 
         ideal_counts = self._get_ideal_counts(self.circuit, self.backend_name)
         fidelity = compute_hellinger_fidelity(ideal_counts, noisy_counts)

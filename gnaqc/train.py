@@ -272,6 +272,9 @@ def _train_single_backend(
     best_avg_fidelity = 0.0
     log_file = open(f"{run_dir}/{backend_name}_training_log.csv", "w")
     log_file.write("episode,total_reward,terminal_fidelity,loss,epsilon\n")
+    crash_file = open(f"{run_dir}/{backend_name}_crashes.csv", "w")
+    crash_file.write("episode,circuit,num_logical,layout,error_type,error\n")
+    num_crashes = 0
 
     for episode in range(cfg.num_episodes):
         circ_name, circ = random.choice(valid_circuits)
@@ -298,6 +301,13 @@ def _train_single_backend(
                 )
 
             next_state, reward, done = env.step(action)
+
+            # If the terminal noisy simulation crashed, skip this transition:
+            # a synthetic reward=0 would teach the agent that this layout is
+            # bad, biasing learning with a failure that is actually external.
+            if env.crashed:
+                break
+
             total_reward += reward
 
             replay_buffer.add(Transition(
@@ -329,6 +339,21 @@ def _train_single_backend(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # prevent gradient explosion
                 optimizer.step()
                 episode_loss = loss.item()
+
+        if env.crashed:
+            info = env.crash_info or {}
+            crash_file.write(
+                f"{episode},{circ_name},{info.get('num_logical','')},"
+                f"\"{info.get('layout','')}\",{info.get('error_type','')},"
+                f"\"{info.get('error','')}\"\n"
+            )
+            crash_file.flush()
+            num_crashes += 1
+            logger.warning(
+                f"[{backend_name}] Episode {episode} crashed on {circ_name} "
+                f"({info.get('error_type','')}); skipped. Total crashes: {num_crashes}"
+            )
+            continue
 
         terminal_fidelity = max(0, total_reward - cfg.flat_reward * env.num_logical) / cfg.terminal_reward_scale
         episode_rewards.append(total_reward)
@@ -367,7 +392,12 @@ def _train_single_backend(
 
     torch.save(model.state_dict(), f"{run_dir}/checkpoints/{backend_name}_final.pt")
     log_file.close()
-    logger.info(f"\n[{backend_name}] Training complete. Best avg fidelity: {best_avg_fidelity:.4f}")
+    crash_file.close()
+    logger.info(
+        f"\n[{backend_name}] Training complete. "
+        f"Best avg fidelity: {best_avg_fidelity:.4f}. "
+        f"Simulator crashes skipped: {num_crashes}"
+    )
 
 
 # ---------------------------------------------------------------------------
