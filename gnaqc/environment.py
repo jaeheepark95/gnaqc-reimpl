@@ -6,6 +6,12 @@ Terminal reward is Hellinger fidelity x 100 from noisy simulation.
 State = (backend_node_features, backend_edge_matrix, circuit_features, mapping_vector).
 Action = logical_idx * N + physical_idx (N^2 discrete actions).
 
+Noise diversity: when cfg.noise_perturb_enabled is True, each call to reset()
+applies a fresh perturbation of the backend's noise parameters (drawn from a
+reproducible RNG). Topology is preserved. Ideal simulation is cached per circuit
+since it is layout/noise-independent; noisy simulators and backend features are
+recomputed whenever the noise instance changes.
+
 References:
     - LeCompte et al., IEEE TQE 2023, Section V (RL Setup).
 """
@@ -26,6 +32,7 @@ from gnaqc.features import (
     get_intermediate_circuit,
 )
 from gnaqc.fidelity import compute_hellinger_fidelity
+from gnaqc.noise_perturbation import perturb_backend_noise
 from gnaqc.simulator import create_ideal_simulator, create_noisy_simulator
 
 
@@ -36,19 +43,28 @@ class QubitAllocationEnv:
         - Mapping vector initialized to -1 (not 0) to avoid 0-based indexing conflict.
         - Action masking with -inf (paper uses 0 reward for invalid actions).
         - Ideal simulation cached per circuit (paper recomputes each episode).
+        - Noise perturbation simulates 150-day calibration diversity.
     """
 
     def __init__(self, cfg: GNAQCConfig, device: torch.device = torch.device("cpu")):
         self.cfg = cfg
         self.device = device
 
-        # Caches (persist across episodes)
-        self._backend_cache: dict[str, dict[str, Any]] = {}
+        # Ideal counts cache: layout/noise-independent, keyed by circuit name
         self._ideal_cache: dict[str, dict[str, int]] = {}
-        self._simulator_cache: dict[str, tuple] = {}
+        # Ideal simulator per base backend (noise doesn't affect ideal)
+        self._ideal_sim_cache: dict[str, Any] = {}
 
-        # Episode state (set in reset())
-        self.backend = None
+        # Noise RNG (reproducible across episodes)
+        if cfg.noise_perturb_enabled:
+            self._noise_rng = np.random.default_rng(cfg.noise_perturb_seed)
+        else:
+            self._noise_rng = None
+
+        # Episode state
+        self.base_backend = None         # original un-perturbed backend
+        self.backend = None              # possibly-perturbed backend used this episode
+        self.noisy_sim = None            # noisy simulator for this episode's backend
         self.backend_name: str = ""
         self.circuit: QuantumCircuit | None = None
         self.num_physical: int = 0
@@ -61,37 +77,41 @@ class QubitAllocationEnv:
         self.placed_physical: set[int] = set()
         self.done: bool = False
 
-    def _get_backend_data(self, backend, backend_name: str) -> dict[str, Any]:
-        """Get or compute cached backend features."""
-        if backend_name not in self._backend_cache:
-            node_feat = extract_backend_node_features(backend)
-            edge_mat = extract_backend_edge_matrix(backend)
-            self._backend_cache[backend_name] = {
-                "node_features": torch.tensor(node_feat, dtype=torch.float32, device=self.device),
-                "edge_matrix": torch.tensor(edge_mat, dtype=torch.float32, device=self.device),
-                "num_physical": backend.target.num_qubits,
-            }
-        return self._backend_cache[backend_name]
+    # -----------------------------------------------------------------
+    # Per-episode backend preparation
+    # -----------------------------------------------------------------
 
-    def _get_simulators(self, backend, backend_name: str):
-        """Get or create cached simulators for a backend."""
-        if backend_name not in self._simulator_cache:
-            ideal_sim = create_ideal_simulator(backend)
-            noisy_sim = create_noisy_simulator(backend)
-            self._simulator_cache[backend_name] = (ideal_sim, noisy_sim)
-        return self._simulator_cache[backend_name]
+    def _prepare_backend(self, base_backend, backend_name: str):
+        """Perturb the base backend (if enabled) and set up features + simulator."""
+        if self.cfg.noise_perturb_enabled and self._noise_rng is not None:
+            backend = perturb_backend_noise(
+                base_backend, self._noise_rng, self.cfg.perturbation_scales()
+            )
+        else:
+            backend = base_backend
+
+        node_feat = extract_backend_node_features(backend)
+        edge_mat = extract_backend_edge_matrix(backend)
+
+        self.backend = backend
+        self.noisy_sim = create_noisy_simulator(backend)
+        self.node_features = torch.tensor(node_feat, dtype=torch.float32, device=self.device)
+        self.edge_matrix = torch.tensor(edge_mat, dtype=torch.float32, device=self.device)
+        self.num_physical = backend.target.num_qubits
+
+    def _get_ideal_sim(self, backend_name: str):
+        """Ideal simulator depends only on base backend (topology + basis gates)."""
+        if backend_name not in self._ideal_sim_cache:
+            self._ideal_sim_cache[backend_name] = create_ideal_simulator(self.base_backend)
+        return self._ideal_sim_cache[backend_name]
 
     def _get_ideal_counts(
-        self, circuit: QuantumCircuit, backend, backend_name: str
+        self, circuit: QuantumCircuit, backend_name: str
     ) -> dict[str, int]:
-        """Get or compute cached ideal simulation counts.
-
-        Ideal simulation is layout-independent, so we compute once per circuit
-        and reuse across all episodes. This halves training time.
-        """
+        """Cached ideal counts (noise-independent). Computed once per circuit."""
         cache_key = f"{circuit.name}_{backend_name}"
         if cache_key not in self._ideal_cache:
-            ideal_sim, _ = self._get_simulators(backend, backend_name)
+            ideal_sim = self._get_ideal_sim(backend_name)
 
             meas_circuit = circuit.copy()
             if meas_circuit.num_clbits == 0:
@@ -99,13 +119,17 @@ class QubitAllocationEnv:
 
             compiled = transpile(
                 meas_circuit,
-                backend=backend,
+                backend=self.base_backend,
                 optimization_level=0,
                 seed_transpiler=self.cfg.seed_transpiler,
             )
-            result = ideal_sim.run(compiled, shots=self.cfg.shots).result()
+            result = ideal_sim.run(compiled, shots=self.cfg.train_shots).result()
             self._ideal_cache[cache_key] = result.get_counts()
         return self._ideal_cache[cache_key]
+
+    # -----------------------------------------------------------------
+    # Gym-like interface
+    # -----------------------------------------------------------------
 
     def reset(
         self,
@@ -115,28 +139,20 @@ class QubitAllocationEnv:
     ) -> dict[str, torch.Tensor]:
         """Reset environment for a new episode.
 
-        Args:
-            circuit: Original quantum circuit (will be decomposed to intermediate form).
-            backend: FakeBackendV2 instance.
-            backend_name: Backend identifier for caching.
-
-        Returns:
-            Initial state dict.
+        Applies a fresh noise perturbation (if enabled). Ideal counts are
+        cached per circuit; noisy simulator is rebuilt each episode.
         """
-        self.backend = backend
+        self.base_backend = backend
         self.backend_name = backend_name
         self.done = False
         self.placed_logical = set()
         self.placed_physical = set()
 
-        # Backend features (cached)
-        bd = self._get_backend_data(backend, backend_name)
-        self.node_features = bd["node_features"]
-        self.edge_matrix = bd["edge_matrix"]
-        self.num_physical = bd["num_physical"]
+        # Prepare (possibly-perturbed) backend + features + noisy simulator
+        self._prepare_backend(backend, backend_name)
 
-        # Circuit features (intermediate circuit)
-        intermediate = get_intermediate_circuit(circuit, backend)
+        # Circuit features from intermediate circuit
+        intermediate = get_intermediate_circuit(circuit, self.base_backend)
         self.circuit = intermediate
         self.num_logical = intermediate.num_qubits
         circuit_feat = extract_circuit_features(
@@ -151,13 +167,12 @@ class QubitAllocationEnv:
             (self.num_physical,), -1.0, dtype=torch.float32, device=self.device
         )
 
-        # Pre-cache ideal simulation
-        self._get_ideal_counts(intermediate, backend, backend_name)
+        # Pre-cache ideal simulation (noise-independent)
+        self._get_ideal_counts(intermediate, backend_name)
 
         return self._get_state()
 
     def _get_state(self) -> dict[str, torch.Tensor]:
-        """Return current state as a dict of tensors."""
         return {
             "node_features": self.node_features,
             "edge_matrix": self.edge_matrix,
@@ -166,30 +181,18 @@ class QubitAllocationEnv:
         }
 
     def step(self, action: int) -> tuple[dict[str, torch.Tensor], float, bool]:
-        """Execute one placement action.
-
-        Args:
-            action: action_idx = logical_idx * N + physical_idx.
-
-        Returns:
-            (next_state, reward, done).
-        """
+        """Execute one placement action."""
         N = self.num_physical
         logical_idx = action // N
         physical_idx = action % N
 
-        # Case 1: Already placed logical qubit -> 0 reward
         if logical_idx in self.placed_logical:
             return self._get_state(), 0.0, self.done
-
-        # Case 2: Physical qubit already occupied -> 0 reward
         if physical_idx in self.placed_physical:
             return self._get_state(), 0.0, self.done
 
-        # Case 3: Ancilla qubit
         is_ancilla = logical_idx >= self.num_logical
 
-        # Place the qubit
         self.mapping_vector[physical_idx] = float(logical_idx)
         self.placed_logical.add(logical_idx)
         self.placed_physical.add(physical_idx)
@@ -197,9 +200,8 @@ class QubitAllocationEnv:
         if is_ancilla:
             reward = 0.0
         else:
-            reward = self.cfg.flat_reward  # +10
+            reward = self.cfg.flat_reward
 
-        # Check terminal: all logical qubits placed
         all_logical_placed = all(
             i in self.placed_logical for i in range(self.num_logical)
         )
@@ -212,8 +214,7 @@ class QubitAllocationEnv:
         return self._get_state(), reward, self.done
 
     def _compute_terminal_reward(self) -> float:
-        """Compute Hellinger fidelity x 100 for the completed layout."""
-        # Build layout list
+        """Hellinger fidelity x 100 for the completed layout under current noise."""
         layout_list = [None] * self.num_logical
         for phys_idx in range(self.num_physical):
             logical_idx = int(self.mapping_vector[phys_idx].item())
@@ -236,31 +237,25 @@ class QubitAllocationEnv:
             seed_transpiler=self.cfg.seed_transpiler,
         )
 
-        _, noisy_sim = self._get_simulators(self.backend, self.backend_name)
-        noisy_counts = noisy_sim.run(compiled, shots=self.cfg.shots).result().get_counts()
+        noisy_counts = self.noisy_sim.run(
+            compiled, shots=self.cfg.train_shots
+        ).result().get_counts()
 
-        ideal_counts = self._get_ideal_counts(
-            self.circuit, self.backend, self.backend_name
-        )
-
+        ideal_counts = self._get_ideal_counts(self.circuit, self.backend_name)
         fidelity = compute_hellinger_fidelity(ideal_counts, noisy_counts)
         return fidelity * self.cfg.terminal_reward_scale
 
     def invalid_action_mask(self) -> torch.Tensor:
-        """Return boolean mask over N^2 actions. True = invalid."""
         N = self.num_physical
         mask = torch.zeros(N * N, dtype=torch.bool, device=self.device)
-
         for action_idx in range(N * N):
             logical_idx = action_idx // N
             physical_idx = action_idx % N
             if logical_idx in self.placed_logical or physical_idx in self.placed_physical:
                 mask[action_idx] = True
-
         return mask
 
     def valid_actions(self) -> list[int]:
-        """Return list of valid action indices."""
         N = self.num_physical
         valid = []
         unplaced_logical = set(range(N)) - self.placed_logical

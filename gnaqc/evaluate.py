@@ -1,7 +1,7 @@
 """Evaluation script for GNAQC.
 
 Compares GNAQC layouts against 4 baseline methods (trivial, dense, noise_adaptive, sabre)
-using Hellinger fidelity as the primary metric.
+using BOTH Hellinger fidelity (paper's metric) and PST (common in qubit-mapping literature).
 
 Usage:
     python -m gnaqc.evaluate \
@@ -25,7 +25,7 @@ from qiskit import QuantumCircuit, transpile
 from gnaqc.backend import get_backend
 from gnaqc.config import GNAQCConfig
 from gnaqc.environment import QubitAllocationEnv
-from gnaqc.fidelity import compute_hellinger_fidelity
+from gnaqc.fidelity import compute_hellinger_fidelity, compute_pst
 from gnaqc.model import GNAQCNetwork
 from gnaqc.simulator import create_ideal_simulator, create_noisy_simulator
 from gnaqc.train import load_training_circuits
@@ -80,7 +80,8 @@ def evaluate_gnaqc_layout(
     noisy_sim = create_noisy_simulator(backend)
     ideal_counts = ideal_sim.run(compiled, shots=cfg.shots).result().get_counts()
     noisy_counts = noisy_sim.run(compiled, shots=cfg.shots).result().get_counts()
-    fidelity = compute_hellinger_fidelity(ideal_counts, noisy_counts)
+    hellinger = compute_hellinger_fidelity(ideal_counts, noisy_counts)
+    pst = compute_pst(ideal_counts, noisy_counts)
 
     ops = compiled.count_ops()
     cx_count = sum(ops.get(g, 0) for g in ("cx", "ecr", "cz"))
@@ -88,7 +89,8 @@ def evaluate_gnaqc_layout(
     return {
         "method": "gnaqc",
         "layout": str(layout_list),
-        "fidelity": fidelity,
+        "hellinger": hellinger,
+        "pst": pst,
         "depth": compiled.depth(),
         "cx_count": cx_count,
     }
@@ -115,14 +117,16 @@ def evaluate_baseline_layout(
     noisy_sim = create_noisy_simulator(backend)
     ideal_counts = ideal_sim.run(compiled, shots=cfg.shots).result().get_counts()
     noisy_counts = noisy_sim.run(compiled, shots=cfg.shots).result().get_counts()
-    fidelity = compute_hellinger_fidelity(ideal_counts, noisy_counts)
+    hellinger = compute_hellinger_fidelity(ideal_counts, noisy_counts)
+    pst = compute_pst(ideal_counts, noisy_counts)
 
     ops = compiled.count_ops()
     cx_count = sum(ops.get(g, 0) for g in ("cx", "ecr", "cz"))
 
     return {
         "method": layout_method,
-        "fidelity": fidelity,
+        "hellinger": hellinger,
+        "pst": pst,
         "depth": compiled.depth(),
         "cx_count": cx_count,
     }
@@ -172,7 +176,10 @@ def evaluate(
         gnaqc_result["backend"] = backend_name
         gnaqc_result["num_qubits"] = circuit.num_qubits
         results.append(gnaqc_result)
-        logger.info(f"  GNAQC:            fidelity={gnaqc_result['fidelity']:.4f}")
+        logger.info(
+            f"  GNAQC:            hellinger={gnaqc_result['hellinger']:.4f}  "
+            f"pst={gnaqc_result['pst']:.4f}"
+        )
 
         # Baselines
         for method in BASELINE_METHODS:
@@ -182,7 +189,10 @@ def evaluate(
                 bl_result["backend"] = backend_name
                 bl_result["num_qubits"] = circuit.num_qubits
                 results.append(bl_result)
-                logger.info(f"  {method:16s}: fidelity={bl_result['fidelity']:.4f}")
+                logger.info(
+                    f"  {method:16s}: hellinger={bl_result['hellinger']:.4f}  "
+                    f"pst={bl_result['pst']:.4f}"
+                )
             except Exception as e:
                 logger.warning(f"  {method} failed: {e}")
 
@@ -192,11 +202,13 @@ def evaluate(
     logger.info(f"\nResults saved to {csv_path}")
 
     if not df.empty:
-        summary = df.groupby("method")["fidelity"].agg(["mean", "std", "min", "max"])
-        logger.info(f"\nSummary:\n{summary.to_string()}")
+        for metric in ("hellinger", "pst"):
+            summary = df.groupby("method")[metric].agg(["mean", "std", "min", "max"]).round(4)
+            summary = summary.sort_values("mean", ascending=False)
+            logger.info(f"\n=== Summary ({metric}) ===\n{summary.to_string()}")
 
-        pivot = df.pivot_table(index="circuit", columns="method", values="fidelity")
-        logger.info(f"\nPer-circuit fidelity:\n{pivot.to_string()}")
+            pivot = df.pivot_table(index="circuit", columns="method", values=metric).round(4)
+            logger.info(f"\n=== Per-circuit {metric} ===\n{pivot.to_string()}")
 
     return df
 
@@ -207,13 +219,20 @@ def main():
     parser.add_argument("--backend", required=True, help="Backend name (e.g. nairobi)")
     parser.add_argument("--circuit-dir", type=str, default="circuits",
                         help="Directory containing .qasm benchmark circuits")
-    parser.add_argument("--shots", type=int, default=10000)
+    parser.add_argument("--shots", type=int, default=8192,
+                        help="Evaluation shots (default 8192, aligned with GraphQMap)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default=None)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    cfg = GNAQCConfig(shots=args.shots, seed_transpiler=args.seed)
+    # Evaluation: fixed calibration (no noise perturbation) for deterministic comparison
+    cfg = GNAQCConfig(
+        shots=args.shots,
+        eval_shots=args.shots,
+        seed_transpiler=args.seed,
+        noise_perturb_enabled=False,
+    )
     evaluate(
         checkpoint_path=args.checkpoint,
         backend_name=args.backend,

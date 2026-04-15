@@ -33,11 +33,17 @@ from gnaqc.model import GNAQCNetwork, create_model, create_target_model
 
 logger = logging.getLogger(__name__)
 
-# Default benchmark circuits (subset used in the paper)
+# 25 Pozzi benchmark circuits (12 train + 13 test from the colleague's split,
+# but used here as a single training/evaluation set — Option A).
 BENCHMARK_CIRCUITS = [
+    # Pozzi "train" 12
     "bv_n3", "bv_n4", "peres_3", "toffoli_3", "fredkin_3",
     "xor5_254", "3_17_13", "4mod5-v1_22", "mod5mils_65",
     "alu-v0_27", "decod24-v2_43", "4gt13_92",
+    # Pozzi "test" 13
+    "ham3_102", "miller_11", "decod24-v0_38", "rd32-v0_66", "4gt5_76",
+    "4mod7-v0_94", "alu-v2_32", "hwb4_49", "ex1_226", "decod24-bdd_294",
+    "ham7_104", "rd53_138", "qft_10",
 ]
 
 
@@ -97,30 +103,43 @@ def _collate_batch(
 
 def load_training_circuits(
     circuit_dir: str = "circuits",
+    circuit_names: list[str] | None = None,
 ) -> list[tuple[str, QuantumCircuit]]:
-    """Load training circuits from QASM files.
+    """Load benchmark circuits from QASM files, filtered by the 25 Pozzi set.
 
-    Looks in the given directory for .qasm files.
+    Args:
+        circuit_dir: Directory containing <name>.qasm files.
+        circuit_names: Specific circuits to load (defaults to BENCHMARK_CIRCUITS).
 
     Returns:
-        List of (name, QuantumCircuit) tuples.
+        List of (name, QuantumCircuit) in the order of `circuit_names`.
     """
-    circuits = []
-    circuit_path = Path(circuit_dir)
-    if circuit_path.exists():
-        for qasm_file in sorted(circuit_path.glob("*.qasm")):
-            name = qasm_file.stem
-            try:
-                qc = QuantumCircuit.from_qasm_file(str(qasm_file))
-                circuits.append((name, qc))
-            except Exception as e:
-                logger.warning(f"Failed to load {qasm_file}: {e}")
+    if circuit_names is None:
+        circuit_names = BENCHMARK_CIRCUITS
 
+    circuits: list[tuple[str, QuantumCircuit]] = []
+    circuit_path = Path(circuit_dir)
+    missing = []
+    for name in circuit_names:
+        qasm_file = circuit_path / f"{name}.qasm"
+        if not qasm_file.exists():
+            missing.append(name)
+            continue
+        try:
+            qc = QuantumCircuit.from_qasm_file(str(qasm_file))
+            circuits.append((name, qc))
+        except Exception as e:
+            logger.warning(f"Failed to load {qasm_file}: {e}")
+
+    if missing:
+        logger.warning(
+            f"Missing {len(missing)} circuit(s) in {circuit_dir}: {missing}"
+        )
     if not circuits:
-        logger.info("No circuits found in %s, generating default benchmarks", circuit_dir)
+        logger.info("No circuits loaded, falling back to auto-generated benchmarks")
         circuits = _generate_default_circuits()
 
-    logger.info(f"Loaded {len(circuits)} training circuits")
+    logger.info(f"Loaded {len(circuits)} benchmark circuits from {circuit_dir}")
     return circuits
 
 
@@ -356,14 +375,17 @@ def _train_single_backend(
 
 def main():
     parser = argparse.ArgumentParser(description="Train GNAQC")
-    parser.add_argument("--backends", nargs="+", default=["nairobi", "algiers"],
-                        help="Backend names (e.g. nairobi algiers)")
+    parser.add_argument("--backends", nargs="+", default=["toronto", "rochester"],
+                        help="Backend names (e.g. toronto rochester)")
     parser.add_argument("--episodes", type=int, default=5000)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--epsilon", type=float, default=0.05)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--gnn-hidden", type=int, default=64)
-    parser.add_argument("--shots", type=int, default=10000)
+    parser.add_argument("--train-shots", type=int, default=1000,
+                        help="Shots for per-episode noisy simulation (lower = faster)")
+    parser.add_argument("--no-noise-perturb", action="store_true",
+                        help="Disable noise perturbation (use fixed backend calibration)")
     parser.add_argument("--name", type=str, default="", help="Run name suffix")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--circuit-dir", type=str, default="circuits",
@@ -386,7 +408,9 @@ def main():
         epsilon=args.epsilon,
         batch_size=args.batch_size,
         gnn_hidden=args.gnn_hidden,
-        shots=args.shots,
+        train_shots=args.train_shots,
+        shots=args.train_shots,  # back-compat: environment uses cfg.train_shots
+        noise_perturb_enabled=not args.no_noise_perturb,
     )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

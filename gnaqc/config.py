@@ -33,14 +33,39 @@ class GNAQCConfig:
     look_ahead: int = 1                 # [paper] default CNOT partner look-ahead window
 
     # === Training Backends ===
-    backends: list[str] = field(default_factory=lambda: ["nairobi", "algiers"])
+    backends: list[str] = field(default_factory=lambda: ["toronto", "rochester"])
 
-    # === Simulation ===
-    shots: int = 10000                  # [paper] Section III: 10,000 shots
+    # === Simulation (train vs eval split) ===
+    # Training uses fewer shots for speed; evaluation uses more for accuracy.
+    train_shots: int = 1000             # fast noise-reward estimation during RL
+    eval_shots: int = 8192              # aligned with GraphQMap for fair comparison
+    # Back-compat alias — defaults to train_shots; evaluate.py uses eval_shots explicitly
+    shots: int = 1000
     routing_method: str = "sabre"       # [paper] Qiskit default routing
     seed_transpiler: int = 42           # deterministic routing for reproducibility
 
+    # === Noise Perturbation (simulates daily calibration diversity) ===
+    noise_perturb_enabled: bool = True  # disable for deterministic eval
+    noise_perturb_seed: int = 2024      # base seed for per-episode noise RNG
+    # Per-property perturbation scales (uniform in [1-s, 1+s])
+    noise_scale_2q_error: float = 0.30     # [paper-inspired] +/- 30%
+    noise_scale_1q_error: float = 0.30
+    noise_scale_readout_error: float = 0.30
+    noise_scale_t1: float = 0.20           # +/- 20%
+    noise_scale_t2: float = 0.20
+    noise_scale_duration: float = 0.10     # +/- 10%
+
     # === Action Masking ===
     # Paper uses 0 reward for invalid actions; we use -inf masking for faster convergence.
-    # Set to False to match paper's original behavior (0 reward, no masking).
     use_action_masking: bool = True
+
+    def perturbation_scales(self) -> dict[str, float]:
+        """Return perturbation scales dict for noise_perturbation.perturb_backend_noise()."""
+        return {
+            "2q_error": self.noise_scale_2q_error,
+            "1q_error": self.noise_scale_1q_error,
+            "readout_error": self.noise_scale_readout_error,
+            "t1": self.noise_scale_t1,
+            "t2": self.noise_scale_t2,
+            "duration": self.noise_scale_duration,
+        }
