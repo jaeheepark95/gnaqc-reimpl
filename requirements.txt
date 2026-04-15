@@ -1,6 +1,16 @@
-torch>=2.0
+# Install PyTorch separately BEFORE this file (CUDA index URL required):
+#   pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+
+# Qiskit must stay < 2.0 — qiskit-aer-gpu 0.15.x is incompatible with qiskit 2.x
 qiskit>=1.0,<2.0
-qiskit-ibm-runtime
-qiskit-aer
-numpy
-pandas
+qiskit-ibm-runtime>=0.20,<1.0
+
+# qiskit-aer-gpu is required for tensor_network GPU simulation.
+# Do NOT install qiskit-aer — they conflict.
+qiskit-aer-gpu==0.15.1
+
+# cuQuantum 24.x required — 25.x breaks qiskit-aer-gpu 0.15.1.
+cuquantum-cu12>=24.0,<25.0
+
+numpy>=1.23,<2.0
+pandas>=2.0

@@ -39,8 +39,6 @@ class GNAQCConfig:
     # Training uses fewer shots for speed; evaluation uses more for accuracy.
     train_shots: int = 1000             # fast noise-reward estimation during RL
     eval_shots: int = 8192              # aligned with GraphQMap for fair comparison
-    # Back-compat alias — defaults to train_shots; evaluate.py uses eval_shots explicitly
-    shots: int = 1000
     routing_method: str = "sabre"       # [paper] Qiskit default routing
     seed_transpiler: int = 42           # deterministic routing for reproducibility
 

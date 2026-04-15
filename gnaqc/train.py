@@ -33,14 +33,15 @@ from gnaqc.model import GNAQCNetwork, create_model, create_target_model
 
 logger = logging.getLogger(__name__)
 
-# 25 Pozzi benchmark circuits (12 train + 13 test from the colleague's split,
-# but used here as a single training/evaluation set — Option A).
+# 25 Pozzi benchmark circuits, organized into two categories (12 + 13).
+# Within each category, the same circuits are used for both training and
+# evaluation (no held-out split; train set == test set per category).
 BENCHMARK_CIRCUITS = [
-    # Pozzi "train" 12
+    # Category A (12)
     "bv_n3", "bv_n4", "peres_3", "toffoli_3", "fredkin_3",
     "xor5_254", "3_17_13", "4mod5-v1_22", "mod5mils_65",
     "alu-v0_27", "decod24-v2_43", "4gt13_92",
-    # Pozzi "test" 13
+    # Category B (13)
     "ham3_102", "miller_11", "decod24-v0_38", "rd32-v0_66", "4gt5_76",
     "4mod7-v0_94", "alu-v2_32", "hwb4_49", "ex1_226", "decod24-bdd_294",
     "ham7_104", "rd53_138", "qft_10",
@@ -409,7 +410,6 @@ def main():
         batch_size=args.batch_size,
         gnn_hidden=args.gnn_hidden,
         train_shots=args.train_shots,
-        shots=args.train_shots,  # back-compat: environment uses cfg.train_shots
         noise_perturb_enabled=not args.no_noise_perturb,
     )
 

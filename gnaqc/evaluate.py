@@ -16,7 +16,6 @@ import argparse
 import logging
 import os
 from datetime import datetime
-from pathlib import Path
 
 import pandas as pd
 import torch
@@ -76,8 +75,8 @@ def evaluate_gnaqc_layout(
 
     ideal_sim = create_ideal_simulator(backend)
     noisy_sim = create_noisy_simulator(backend)
-    ideal_counts = ideal_sim.run(compiled, shots=cfg.shots).result().get_counts()
-    noisy_counts = noisy_sim.run(compiled, shots=cfg.shots).result().get_counts()
+    ideal_counts = ideal_sim.run(compiled, shots=cfg.eval_shots).result().get_counts()
+    noisy_counts = noisy_sim.run(compiled, shots=cfg.eval_shots).result().get_counts()
     hellinger = compute_hellinger_fidelity(ideal_counts, noisy_counts)
     pst = compute_pst(ideal_counts, noisy_counts)
 
@@ -111,8 +110,8 @@ def evaluate_baseline_layout(
 
     ideal_sim = create_ideal_simulator(backend)
     noisy_sim = create_noisy_simulator(backend)
-    ideal_counts = ideal_sim.run(compiled, shots=cfg.shots).result().get_counts()
-    noisy_counts = noisy_sim.run(compiled, shots=cfg.shots).result().get_counts()
+    ideal_counts = ideal_sim.run(compiled, shots=cfg.eval_shots).result().get_counts()
+    noisy_counts = noisy_sim.run(compiled, shots=cfg.eval_shots).result().get_counts()
     hellinger = compute_hellinger_fidelity(ideal_counts, noisy_counts)
     pst = compute_pst(ideal_counts, noisy_counts)
 
@@ -224,7 +223,6 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     # Evaluation: fixed calibration (no noise perturbation) for deterministic comparison
     cfg = GNAQCConfig(
-        shots=args.shots,
         eval_shots=args.shots,
         seed_transpiler=args.seed,
         noise_perturb_enabled=False,

@@ -32,21 +32,38 @@ Combined: Concat → Dense + ReLU → Dense → N² Q-values
 
 ## Setup
 
-```bash
-# Install PyTorch first (adjust CUDA version as needed)
-pip install torch --index-url https://download.pytorch.org/whl/cu121
+The project uses `qiskit-aer-gpu` (with cuQuantum) for tensor-network GPU simulation. Versions are pinned because `qiskit>=2.0`, `cuquantum-cu12>=25.0`, and `qiskit-aer` (non-GPU) all break `qiskit-aer-gpu==0.15.1`.
 
-# Install remaining dependencies
+```bash
+# 1. Create environment (Python 3.10+)
+conda create -n gnaqc python=3.10 -y && conda activate gnaqc
+
+# 2. Install PyTorch with CUDA (version must match your system CUDA)
+pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+
+# 3. Install remaining dependencies
 pip install -r requirements.txt
+
+# 4. Verify GPU simulation is available
+python -c "
+import torch; print('CUDA:', torch.cuda.is_available(), torch.cuda.get_device_name(0))
+from qiskit_aer import AerSimulator
+sim = AerSimulator(method='tensor_network', device='GPU')
+print('tensor_network+GPU simulator OK')
+"
 ```
+
+**Do not install `qiskit-aer`** — it conflicts with `qiskit-aer-gpu`. If you see import errors related to `AerSimulator`, uninstall both and reinstall only `qiskit-aer-gpu==0.15.1`.
+
+A CUDA-capable GPU is **required** — the simulator is hardcoded to `method="tensor_network", device="GPU"` with no CPU fallback. If the GPU path is unavailable, `AerSimulator` construction will raise.
 
 ## Benchmark Circuits
 
 The `circuits/` directory contains **25 Pozzi benchmark circuits** (original high-level QASM, not basis-gate-normalized). Gate decomposition to basis gates `{cx, rz, sx, x, id}` is performed internally via `get_intermediate_circuit()` at train/eval time, matching the paper's Section IV-B intent ("intermediate circuit after decomposition, before allocation").
 
-Circuits (12 "train" + 13 "test" from the Pozzi/attention-qubit-mapping split, used together as a single training set):
+The circuits are organized into two categories from the Pozzi/attention-qubit-mapping split (12 + 13). **Within each category, the same circuits are used for both training and evaluation** — i.e. there is no held-out split; train set == test set per category.
 
-| Train (12) | Qubits | Test (13) | Qubits |
+| Category A (12) | Qubits | Category B (13) | Qubits |
 |---|:---:|---|:---:|
 | bv_n3, bv_n4 | 3-4 | ham3_102, miller_11 | 3 |
 | peres_3, toffoli_3, fredkin_3 | 3 | decod24-v0_38, rd32-v0_66 | 4 |
@@ -169,6 +186,12 @@ Per-qubit: SX/X/RZ/ID gate counts, measurement flag, CNOT count, CNOT partner in
 - **Huber loss + gradient clipping (max_norm=10.0)** — replaces MSE. MSE caused Q-value divergence (loss 300 → 2M+ within 1200 episodes); Huber's linear region for large TD errors stabilizes learning
 - Training shots: 1000 (fast reward estimation); Eval shots: 8192 (aligned with other qubit-mapping papers)
 - Noise perturbation sampled fresh every episode; ideal counts cached per circuit (noise-independent)
+
+### Simulation Backend
+`gnaqc/simulator.py` hardcodes `AerSimulator(method="tensor_network", device="GPU")` for both ideal and noisy simulation. There is **no automatic fallback** to statevector / matrix_product_state / CPU — if the GPU path is unavailable, `AerSimulator` construction raises immediately. This was an explicit choice after observing that `automatic` mode silently selected statevector CPU on 27Q backends, making each episode take minutes instead of seconds. `cfg.train_shots` drives training-time reward estimation; `cfg.eval_shots` drives evaluation (the earlier back-compat `cfg.shots` field has been removed).
+
+### Circuit Measurement Handling
+Some benchmark QASM files declare a classical register but emit no `measure` instructions. `environment.ensure_measurements()` detects this by scanning for actual `Measure` ops (not by checking `num_clbits`) and appends `measure_all()` when needed. Both training and evaluation paths share this helper.
 
 ### Differences from Paper
 
