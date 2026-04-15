@@ -65,7 +65,9 @@ def evaluate_gnaqc_layout(
             layout_list[logical_idx] = phys_idx
 
     # Compute fidelity
-    meas_circuit = ensure_measurements(env.circuit)
+    # Use the raw high-level circuit so transpile(opt=3) can fuse/cancel gates
+    # before decomposition — same reasoning as environment._compute_terminal_reward.
+    meas_circuit = ensure_measurements(env.raw_circuit)
 
     compiled = transpile(
         meas_circuit, backend=backend, initial_layout=layout_list,

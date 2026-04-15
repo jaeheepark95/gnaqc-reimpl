@@ -18,13 +18,12 @@ References:
 
 from __future__ import annotations
 
-import signal
-from contextlib import contextmanager
-from typing import Any, Callable, TypeVar
+from typing import Any
 
 import numpy as np
 import torch
 from qiskit import QuantumCircuit, transpile
+from qiskit_aer.noise import NoiseModel
 
 from gnaqc.config import GNAQCConfig
 from gnaqc.features import (
@@ -35,58 +34,34 @@ from gnaqc.features import (
 )
 from gnaqc.fidelity import compute_hellinger_fidelity
 from gnaqc.noise_perturbation import perturb_backend_noise
-from gnaqc.simulator import create_ideal_simulator, create_noisy_simulator
-
-
-_T = TypeVar("_T")
-
-
-class _SimTimeoutError(TimeoutError):
-    """Raised by run_with_signal_timeout when the wall-clock budget is exceeded."""
-
-
-@contextmanager
-def _signal_timeout(seconds: int):
-    """SIGALRM-based timeout. Single-threaded, leak-free.
-
-    Limitations: Linux/Unix only; only the main thread can set signal handlers,
-    so this must not be wrapped around code running in worker threads. The
-    handler raises _SimTimeoutError; C extensions that hold the GIL without
-    releasing it will not be interrupted until they yield back to Python, but
-    cuQuantum/Aer release the GIL during long contractions.
-    """
-    def _handler(signum, frame):
-        raise _SimTimeoutError(f"operation exceeded {seconds}s")
-
-    if seconds <= 0:
-        yield
-        return
-
-    old_handler = signal.signal(signal.SIGALRM, _handler)
-    signal.alarm(seconds)
-    try:
-        yield
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
+from gnaqc.sim_worker import SimWorker, SimWorkerTimeout
+from gnaqc.simulator import _SIM_CONFIG
 
 
 def ensure_measurements(circuit: QuantumCircuit) -> QuantumCircuit:
     """Return a copy with measurements appended if the circuit has none.
 
-    Checks for actual Measure instructions, not just the presence of a classical
-    register — some benchmark QASM files declare `creg` but never measure.
+    Mirrors GraphQMap's / Attention_Qubit_Mapping's `add_measurements()`:
+    measures only the qubits that are actually used by any gate, reusing any
+    pre-existing classical register from the QASM file. This keeps the output
+    bitstring as short as possible — critical for tensor-network simulation,
+    since `measure_all()` on circuits with an oversized `qreg` (e.g. qft_10
+    declares q[16] but uses only 10 qubits) produces an N-bit output with
+    2^N sampling bins and an unnecessarily large noise-propagation graph.
+
+    Using `len(used)` clbits keeps the output distribution at 2^len(used).
     """
-    has_measure = any(
-        instr.operation.name == "measure" for instr in circuit.data
-    )
-    if has_measure:
+    if circuit.count_ops().get("measure", 0) > 0:
         return circuit.copy()
-    qc = circuit.copy()
-    # Drop any empty classical registers that aren't used (measure_all adds a new one)
-    qc.remove_final_measurements(inplace=True)
-    qc.measure_all()
-    return qc
+    from qiskit.circuit import ClassicalRegister
+    used = sorted({circuit.find_bit(q).index for inst in circuit.data for q in inst.qubits})
+    new_qc = circuit.copy()
+    if len(new_qc.clbits) == 0:
+        new_qc.add_register(ClassicalRegister(len(used), "meas"))
+    for idx, q in enumerate(used):
+        if idx < len(new_qc.clbits):
+            new_qc.measure(q, idx)
+    return new_qc
 
 
 class QubitAllocationEnv:
@@ -105,8 +80,11 @@ class QubitAllocationEnv:
 
         # Ideal counts cache: layout/noise-independent, keyed by circuit name
         self._ideal_cache: dict[str, dict[str, int]] = {}
-        # Ideal simulator per base backend (noise doesn't affect ideal)
-        self._ideal_sim_cache: dict[str, Any] = {}
+
+        # Persistent subprocess worker for all AerSimulator calls — gives us
+        # OS-level kill semantics for cuTensorNet hangs that survive in-process
+        # timeouts.
+        self._sim_worker = SimWorker(sim_config=dict(_SIM_CONFIG))
 
         # Noise RNG (reproducible across episodes)
         if cfg.noise_perturb_enabled:
@@ -117,8 +95,13 @@ class QubitAllocationEnv:
         # Episode state
         self.base_backend = None         # original un-perturbed backend
         self.backend = None              # possibly-perturbed backend used this episode
-        self.noisy_sim = None            # noisy simulator for this episode's backend
+        self.noise_model: NoiseModel | None = None  # per-episode noise model (sent to worker)
         self.backend_name: str = ""
+        # `raw_circuit` preserves the high-level gate form (e.g. ccx, h) so
+        # transpile(opt=3) can apply gate-level fusion/cancellation. `circuit`
+        # is the intermediate (post-decomposition) form the paper's §IV-B
+        # requires for circuit-feature extraction.
+        self.raw_circuit: QuantumCircuit | None = None
         self.circuit: QuantumCircuit | None = None
         self.num_physical: int = 0
         self.num_logical: int = 0
@@ -134,6 +117,10 @@ class QubitAllocationEnv:
         # this to skip the episode instead of polluting replay with reward=0.
         self.crashed: bool = False
         self.crash_info: dict[str, Any] | None = None
+        # Cached Hellinger fidelity from the terminal simulation (0 before done
+        # or on crash). Exposed so callers can log it without reconstructing
+        # from total_reward, which is ambiguous under the N^2 action space.
+        self.terminal_fidelity: float = 0.0
 
     # -----------------------------------------------------------------
     # Per-episode backend preparation
@@ -149,19 +136,15 @@ class QubitAllocationEnv:
             backend = base_backend
 
         node_feat = extract_backend_node_features(backend)
-        edge_mat = extract_backend_edge_matrix(backend)
+        edge_mat = extract_backend_edge_matrix(
+            backend, add_self_loops=self.cfg.edge_self_loops
+        )
 
         self.backend = backend
-        self.noisy_sim = create_noisy_simulator(backend)
+        self.noise_model = NoiseModel.from_backend(backend)
         self.node_features = torch.tensor(node_feat, dtype=torch.float32, device=self.device)
         self.edge_matrix = torch.tensor(edge_mat, dtype=torch.float32, device=self.device)
         self.num_physical = backend.target.num_qubits
-
-    def _get_ideal_sim(self, backend_name: str):
-        """Ideal simulator depends only on base backend (topology + basis gates)."""
-        if backend_name not in self._ideal_sim_cache:
-            self._ideal_sim_cache[backend_name] = create_ideal_simulator(self.base_backend)
-        return self._ideal_sim_cache[backend_name]
 
     def _get_ideal_counts(
         self, circuit: QuantumCircuit, backend_name: str
@@ -175,7 +158,6 @@ class QubitAllocationEnv:
         if cache_key in self._ideal_cache:
             return self._ideal_cache[cache_key]
 
-        ideal_sim = self._get_ideal_sim(backend_name)
         meas_circuit = ensure_measurements(circuit)
         compiled = transpile(
             meas_circuit,
@@ -185,11 +167,13 @@ class QubitAllocationEnv:
         )
 
         try:
-            with _signal_timeout(int(self.cfg.train_sim_timeout_s)):
-                counts = ideal_sim.run(
-                    compiled, shots=self.cfg.train_shots
-                ).result().get_counts()
-        except Exception:
+            counts = self._sim_worker.run(
+                compiled,
+                noise_model=None,
+                shots=self.cfg.train_shots,
+                timeout_s=self.cfg.train_sim_timeout_s,
+            )
+        except (SimWorkerTimeout, Exception):
             return None
 
         self._ideal_cache[cache_key] = counts
@@ -215,18 +199,26 @@ class QubitAllocationEnv:
         self.done = False
         self.crashed = False
         self.crash_info = None
+        self.terminal_fidelity = 0.0
         self.placed_logical = set()
         self.placed_physical = set()
+        self._invalid_step_count = 0
 
         # Prepare (possibly-perturbed) backend + features + noisy simulator
         self._prepare_backend(backend, backend_name)
 
-        # Circuit features from intermediate circuit
+        # Keep raw circuit (high-level gates) for simulation-time transpile so
+        # opt=3 can do gate-level fusion. Feature extraction still uses the
+        # intermediate form per paper §IV-B.
+        self.raw_circuit = circuit
         intermediate = get_intermediate_circuit(circuit, self.base_backend)
         self.circuit = intermediate
         self.num_logical = intermediate.num_qubits
         circuit_feat = extract_circuit_features(
-            intermediate, self.num_physical, self.cfg.look_ahead
+            intermediate,
+            self.num_physical,
+            self.cfg.look_ahead,
+            normalize_partners=self.cfg.normalize_circuit_partners,
         )
         self.circuit_features = torch.tensor(
             circuit_feat, dtype=torch.float32, device=self.device
@@ -240,7 +232,7 @@ class QubitAllocationEnv:
         # Pre-cache ideal simulation (noise-independent). If it hangs or fails,
         # mark the episode crashed so the train loop skips it (the while-loop
         # body is guarded by `not env.done`, so setting done=True aborts it).
-        if self._get_ideal_counts(intermediate, backend_name) is None:
+        if self._get_ideal_counts(self.raw_circuit, backend_name) is None:
             self.crashed = True
             self.done = True
             self.crash_info = {
@@ -264,14 +256,26 @@ class QubitAllocationEnv:
         }
 
     def step(self, action: int) -> tuple[dict[str, torch.Tensor], float, bool]:
-        """Execute one placement action."""
+        """Execute one placement action.
+
+        Paper MDP (§V): action space = N_phys^2 over (logical, physical) pairs
+        including ancilla logical indices. Episode terminates when every
+        physical qubit slot is filled (fully-mapped circuit). Ancilla placement
+        yields 0 reward; newly-placing a real logical qubit yields +flat_reward;
+        the final placement additionally returns Hellinger fidelity * scale.
+        """
         N = self.num_physical
         logical_idx = action // N
         physical_idx = action % N
 
-        if logical_idx in self.placed_logical:
-            return self._get_state(), 0.0, self.done
-        if physical_idx in self.placed_physical:
+        if logical_idx in self.placed_logical or physical_idx in self.placed_physical:
+            # Paper §V-C: invalid action => 0 reward, no placement. Under
+            # "zero_reward" mode we must also cap iterations to avoid an
+            # unbounded loop of invalid picks.
+            self._invalid_step_count += 1
+            cap = self.cfg.max_invalid_steps or (self.num_physical * 2)
+            if self._invalid_step_count >= cap:
+                self.done = True
             return self._get_state(), 0.0, self.done
 
         is_ancilla = logical_idx >= self.num_logical
@@ -285,11 +289,9 @@ class QubitAllocationEnv:
         else:
             reward = self.cfg.flat_reward
 
-        all_logical_placed = all(
-            i in self.placed_logical for i in range(self.num_logical)
-        )
+        fully_mapped = len(self.placed_physical) == self.num_physical
 
-        if all_logical_placed and not self.done:
+        if fully_mapped and not self.done:
             terminal_reward = self._compute_terminal_reward()
             reward = terminal_reward
             self.done = True
@@ -307,7 +309,12 @@ class QubitAllocationEnv:
         if any(p is None for p in layout_list):
             return 0.0
 
-        meas_circuit = ensure_measurements(self.circuit)
+        # Use the raw high-level circuit here — opt=3 does gate-level fusion
+        # and cancellation before decomposing to the backend basis, yielding
+        # far shorter compiled circuits than feeding an already-decomposed
+        # intermediate form. Shorter compiled circuit => smaller tensor network
+        # => drastically fewer cuTensorNet contractor path-search failures.
+        meas_circuit = ensure_measurements(self.raw_circuit)
 
         compiled = transpile(
             meas_circuit,
@@ -318,15 +325,18 @@ class QubitAllocationEnv:
             seed_transpiler=self.cfg.seed_transpiler,
         )
 
-        # Wall-clock timeout via SIGALRM: cuTensorNet's contractor autotuner can
-        # occasionally pick a path that runs for many minutes without raising.
-        # We'd rather skip those episodes than hang the whole training.
+        # Subprocess-isolated sim with OS-level timeout. cuTensorNet's contractor
+        # autotuner can pick a path that runs for many minutes while holding the
+        # Python GIL, defeating in-process timeouts. Killing the worker subprocess
+        # bypasses the GIL entirely.
         try:
-            with _signal_timeout(int(self.cfg.train_sim_timeout_s)):
-                noisy_counts = self.noisy_sim.run(
-                    compiled, shots=self.cfg.train_shots
-                ).result().get_counts()
-        except _SimTimeoutError:
+            noisy_counts = self._sim_worker.run(
+                compiled,
+                noise_model=self.noise_model,
+                shots=self.cfg.train_shots,
+                timeout_s=self.cfg.train_sim_timeout_s,
+            )
+        except SimWorkerTimeout:
             self.crashed = True
             self.crash_info = {
                 "backend": self.backend_name,
@@ -352,7 +362,7 @@ class QubitAllocationEnv:
             }
             return 0.0
 
-        ideal_counts = self._get_ideal_counts(self.circuit, self.backend_name)
+        ideal_counts = self._get_ideal_counts(self.raw_circuit, self.backend_name)
         if ideal_counts is None:
             # Defensive: reset() pre-caches ideal counts and aborts the episode
             # on failure, so this branch should not be reachable. Guard against
@@ -369,14 +379,30 @@ class QubitAllocationEnv:
             }
             return 0.0
         fidelity = compute_hellinger_fidelity(ideal_counts, noisy_counts)
+        self.terminal_fidelity = fidelity
         return fidelity * self.cfg.terminal_reward_scale
+
+    def close(self) -> None:
+        """Shut down the simulation worker subprocess. Idempotent."""
+        worker = getattr(self, "_sim_worker", None)
+        if worker is not None:
+            try:
+                worker.shutdown()
+            finally:
+                self._sim_worker = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def invalid_action_mask(self) -> torch.Tensor:
         """Mask invalid actions in the N*N action grid.
 
-        Invalid = logical already placed, physical already occupied, or
-        logical_idx >= num_logical (ancilla indices are not valid actions
-        per the paper's formulation: action space is real_logical x physical).
+        Paper action space is N_phys^2 over (logical, physical) pairs INCLUDING
+        ancilla logical indices (logical_idx in [num_logical, num_physical)).
+        Invalid = logical already placed or physical already occupied.
         """
         N = self.num_physical
         mask = torch.zeros(N * N, dtype=torch.bool, device=self.device)
@@ -384,8 +410,7 @@ class QubitAllocationEnv:
             logical_idx = action_idx // N
             physical_idx = action_idx % N
             if (
-                logical_idx >= self.num_logical
-                or logical_idx in self.placed_logical
+                logical_idx in self.placed_logical
                 or physical_idx in self.placed_physical
             ):
                 mask[action_idx] = True
@@ -394,7 +419,7 @@ class QubitAllocationEnv:
     def valid_actions(self) -> list[int]:
         N = self.num_physical
         valid = []
-        unplaced_logical = set(range(self.num_logical)) - self.placed_logical
+        unplaced_logical = set(range(N)) - self.placed_logical
         unoccupied_physical = set(range(N)) - self.placed_physical
         for l_idx in unplaced_logical:
             for p_idx in unoccupied_physical:

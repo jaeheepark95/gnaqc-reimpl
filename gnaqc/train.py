@@ -247,9 +247,10 @@ def _train_single_backend(
     logger.info(f"Training on backend: {backend_name} ({num_physical}Q)")
     logger.info(f"{'='*60}")
 
+    max_q = getattr(cfg, "_max_circuit_qubits", 0) or num_physical
     valid_circuits = [
         (name, circ) for name, circ in circuits
-        if circ.num_qubits <= num_physical
+        if circ.num_qubits <= min(num_physical, max_q)
     ]
     if not valid_circuits:
         logger.warning(f"No circuits fit on {backend_name}, skipping")
@@ -283,15 +284,24 @@ def _train_single_backend(
         episode_loss = 0.0
 
         while not env.done:
-            # Epsilon-greedy (paper Section V-A)
+            # Epsilon-greedy (paper Section V-A). Under "zero_reward" mode we
+            # present all N^2 actions (including invalid ones) to exercise the
+            # paper MDP's 0-reward learning signal on invalid picks; under
+            # "mask" mode we restrict both random and greedy choices to valid.
+            zero_reward_mode = cfg.invalid_action_mode == "zero_reward"
             if random.random() < cfg.epsilon:
-                valid = env.valid_actions()
-                action = random.choice(valid) if valid else 0
-            else:
-                if cfg.use_action_masking:
-                    invalid_mask = env.invalid_action_mask()
+                if zero_reward_mode:
+                    N = env.num_physical
+                    action = random.randrange(N * N)
                 else:
-                    invalid_mask = None
+                    valid = env.valid_actions()
+                    action = random.choice(valid) if valid else 0
+            else:
+                invalid_mask = (
+                    env.invalid_action_mask()
+                    if (cfg.use_action_masking and not zero_reward_mode)
+                    else None
+                )
                 action = model.get_action(
                     state["node_features"],
                     state["edge_matrix"],
@@ -355,7 +365,7 @@ def _train_single_backend(
             )
             continue
 
-        terminal_fidelity = max(0, total_reward - cfg.flat_reward * env.num_logical) / cfg.terminal_reward_scale
+        terminal_fidelity = env.terminal_fidelity
         episode_rewards.append(total_reward)
         episode_fidelities.append(terminal_fidelity)
 
@@ -393,6 +403,7 @@ def _train_single_backend(
     torch.save(model.state_dict(), f"{run_dir}/checkpoints/{backend_name}_final.pt")
     log_file.close()
     crash_file.close()
+    env.close()
     logger.info(
         f"\n[{backend_name}] Training complete. "
         f"Best avg fidelity: {best_avg_fidelity:.4f}. "
@@ -417,6 +428,15 @@ def main():
                         help="Shots for per-episode noisy simulation (lower = faster)")
     parser.add_argument("--no-noise-perturb", action="store_true",
                         help="Disable noise perturbation (use fixed backend calibration)")
+    parser.add_argument("--no-normalize-partners", action="store_true",
+                        help="Disable CNOT-partner normalization (use raw indices)")
+    parser.add_argument("--edge-self-loops", action="store_true",
+                        help="Add mean-of-neighbors self-loops on edge matrix (non-paper)")
+    parser.add_argument("--invalid-action-mode", choices=["mask", "zero_reward"],
+                        default="mask",
+                        help="'mask' (default, deviation) or 'zero_reward' (paper §V-C)")
+    parser.add_argument("--max-circuit-qubits", type=int, default=0,
+                        help="If >0, only train on circuits with num_qubits <= this")
     parser.add_argument("--name", type=str, default="", help="Run name suffix")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--circuit-dir", type=str, default="circuits",
@@ -441,7 +461,11 @@ def main():
         gnn_hidden=args.gnn_hidden,
         train_shots=args.train_shots,
         noise_perturb_enabled=not args.no_noise_perturb,
+        normalize_circuit_partners=not args.no_normalize_partners,
+        edge_self_loops=args.edge_self_loops,
+        invalid_action_mode=args.invalid_action_mode,
     )
+    cfg._max_circuit_qubits = args.max_circuit_qubits  # consumed in _train_single_backend
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     name_suffix = f"_{args.name}" if args.name else ""

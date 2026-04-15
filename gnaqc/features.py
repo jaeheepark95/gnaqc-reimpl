@@ -117,7 +117,7 @@ def _row_normalize(matrix: np.ndarray) -> np.ndarray:
     return matrix / norms
 
 
-def extract_backend_edge_matrix(backend) -> np.ndarray:
+def extract_backend_edge_matrix(backend, add_self_loops: bool = True) -> np.ndarray:
     """Build N x N edge matrix from 2Q gate error rates, doubly-stochastic normalized.
 
     Self-loops added before normalization (standard GCN practice: A_tilde = A + I)
@@ -144,14 +144,16 @@ def extract_backend_edge_matrix(backend) -> np.ndarray:
         edge_matrix[a, b] = error
         edge_matrix[b, a] = error
 
-    # Add self-loops: diagonal = average of connected edge errors per node
-    for q in range(num_qubits):
-        neighbors = edge_matrix[q, :]
-        nonzero = neighbors[neighbors > 0]
-        if len(nonzero) > 0:
-            edge_matrix[q, q] = np.mean(nonzero)
-        else:
-            edge_matrix[q, q] = 1e-4
+    # Add self-loops: diagonal = average of connected edge errors per node.
+    # Paper's Eq.4 does not use self-loops; keeping this behind a flag for ablation.
+    if add_self_loops:
+        for q in range(num_qubits):
+            neighbors = edge_matrix[q, :]
+            nonzero = neighbors[neighbors > 0]
+            if len(nonzero) > 0:
+                edge_matrix[q, q] = np.mean(nonzero)
+            else:
+                edge_matrix[q, q] = 1e-4
 
     # Doubly-stochastic normalization via Sinkhorn-Knopp
     edge_matrix = _doubly_stochastic_normalize(edge_matrix)
@@ -224,6 +226,7 @@ def extract_circuit_features(
     circuit: QuantumCircuit,
     num_physical: int,
     look_ahead: int = 1,
+    normalize_partners: bool = False,
 ) -> np.ndarray:
     """Extract per-qubit circuit features and pad to num_physical qubits.
 
@@ -290,5 +293,11 @@ def extract_circuit_features(
     for q in range(num_logical, num_physical):
         for la in range(look_ahead):
             features[q, 6 + la] = -1.0
+
+    if normalize_partners and num_physical > 0:
+        # Scale partner indices from [-1, N-1] to ~[-1/N, 1] so they don't
+        # dominate the L2-normalized backend features in the concat layer.
+        for la in range(look_ahead):
+            features[:, 6 + la] = features[:, 6 + la] / num_physical
 
     return features

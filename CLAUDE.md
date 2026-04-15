@@ -11,10 +11,11 @@ The goal is faithful reproduction of the paper's RL-based sequential
 qubit-allocation model with a few deliberate deviations that are
 documented in README.md and, in more detail, below.
 
-Parent consumer project: `/home/jaehee/workspace/projects/GraphQMap/`
-(mirrors this code at `GraphQMap/gnaqc/` with GraphQMap-specific imports
-for `data.hardware_graph`, `evaluation.pst`). When editing this repo,
-consider whether the parent copy also needs the same change.
+Parent consumer project: `/home/jaehee/workspace/projects/GraphQMap/`.
+A stale copy of this code exists at `GraphQMap/gnaqc/` but is **frozen** —
+do NOT mirror edits there. All active development happens only in this
+standalone repo. The parent will re-sync manually when it wants to pull
+a new version of the baseline.
 
 ## Tech Stack
 
@@ -79,17 +80,20 @@ Summary (details in README.md and in the code as comments):
 - Architecture: 2× edge-aware GNN (Eq.4) + circuit/state/concat FFN → N² Q-values (Fig.7)
 - 14-dim backend node features (row-normalized) + doubly-stochastic edge matrix
 - 7-dim per-qubit circuit features from the **intermediate circuit** (post-decomposition, pre-allocation, §IV-B)
-- Reward: +10 per new placement, Hellinger-fidelity × 100 terminal
+- **Action space: N_phys² over (logical, physical) pairs including ancilla indices** (§V-A). Episode terminates when every physical qubit slot is filled.
+- Reward: +10 per new real-logical placement, 0 for ancilla, Hellinger-fidelity × 100 terminal (replaces per-step reward on the final step)
 - ε=0.05 ε-greedy, γ=0.99, DQN with replay buffer + target network
 - Hellinger fidelity (Eq.3) as RL reward
+- Edge matrix is the pure doubly-stochastic CNOT-error adjacency (no self-loops by default, matching Eq.4). Self-loop variant available via `cfg.edge_self_loops=True` / `--edge-self-loops`.
 - Baseline comparison: trivial/dense/noise_adaptive/sabre layouts with SABRE routing
 
 **Deviated (with reasons)**
 - PyTorch instead of TensorFlow (ecosystem)
-- Action masking with −∞ instead of 0-reward for invalid actions (faster convergence). Mask also excludes ancilla logical indices (`logical_idx >= num_logical`) so the action space is real_logical × physical, matching the paper
+- **Invalid-action handling defaults to −∞ masking** (paper §V-C uses 0-reward). Mask prevents the agent from ever picking already-placed logicals or occupied physicals — faster convergence, no risk of non-terminating loops. Paper-faithful 0-reward path available via `--invalid-action-mode zero_reward` (adds a `max_invalid_steps` safety cap = `2 * num_physical`).
 - Mapping vector init with −1 instead of 0 (avoid conflict with qubit index 0). State path uses `nn.Embedding(N+1, d)` — NOT raw linear on integer IDs — so the discrete qubit-index input doesn't leak O(N) magnitude into the L2-normalized feature fusion
+- **Circuit CNOT-partner columns normalized by num_physical** (`cfg.normalize_circuit_partners=True`, default on). Paper leaves them raw; ablation shows +4% fid / more stable convergence vs raw indices, which otherwise dominate the L2-normalized backend path in the concat layer. Disable with `--no-normalize-partners`.
 - Table 1 implemented faithfully: 14 features in paper order [E_ID, L_ID, E_RZ, L_RZ, E_SX, L_SX, E_X, L_X, T1, T2, F, E_M, P_01, P_10]. RZ slots read directly from Target (genuinely 0 on IBM — virtual frame-change gate). P_01/P_10 from `backend.properties().qubit_property('prob_meas1_prep0' / 'prob_meas0_prep1')`
-- **Huber loss + grad_clip(10.0)** instead of MSE — MSE caused Q-value divergence (300 → 2M+ within 1200 eps)
+- **Huber loss + grad_clip(10.0)** instead of unspecified loss — MSE caused Q-value divergence (300 → 2M+ within 1200 eps). Kept on by default
 - Ideal simulation cached per circuit (noise-independent) — ~50% training speedup
 - 150-day daily calibration data unavailable → **per-episode noise perturbation** (±30% error, ±20% T1/T2, ±10% duration); topology and qubit frequency preserved
 - Train shots 1000 / Eval shots 8192 (speed vs. accuracy; eval matches GraphQMap)
@@ -190,24 +194,32 @@ stability, hypothetically). See session notes in git history if needed.
   non-gate op filter (`measure`, `delay`, `reset`, `barrier`, control
   flow) and a per-backend audit.
 
-## Known Issues & Active Investigation
+## Known Issues & Open Questions
 
+- **Noise perturbation strategy is under review**. Scaling-based
+  perturbation trains but may not reflect real day-to-day calibration
+  drift well. Team is discussing alternatives (property-wise shuffle,
+  archival calibration replay). Do not change `noise_perturbation.py`
+  defaults without consensus.
 - **cuTensorNet intermittent failures**: root cause unclear. Suspects
   include (a) noise perturbation generating ill-conditioned Kraus
   operators, (b) SABRE routing producing contraction-unfriendly
-  topologies, (c) cuQuantum 24.x contractor autotune
-  non-determinism. Two parallel 5000-ep runs are currently comparing
-  cuquantum-cu12 24.8 vs 24.11 on GPU 0 / GPU 1 (no-perturb) to isolate
-  (c).
+  topologies, (c) cuQuantum 24.x contractor autotune non-determinism.
+  Handled defensively by skipping crashed episodes.
 - **Rochester (53Q)**: action space 2809. Training expected to be
   significantly slower and more crash-prone than Toronto. Not yet
-  attempted end-to-end. Statevector method is infeasible at 53Q
-  (2^53 ≈ petabytes), so tensor_network is the only option — which
-  means crash handling is load-bearing.
-- **Trained 5000-ep model (Nairobi 7Q, prior experiment)**: mean
-  fidelity 0.79 vs SABRE 0.82 on benchmark set. Model wins on QFT 3Q/4Q
-  (structurally-regular circuits). Main performance gap attributed to
-  lack of calibration diversity in training data.
+  attempted end-to-end with the N² action-space MDP. Statevector method
+  is infeasible at 53Q, so tensor_network is the only option and crash
+  handling is load-bearing.
+
+## Environment Hygiene
+
+Always run from the `gnaqc` conda env (`qiskit 1.4.5`, `qiskit-aer-gpu
+0.15.1`, `cuquantum-cu12 24.11`). The `base` env has `qiskit 2.3.1` +
+CPU-only `qiskit-aer` and will make `tensor_network` sims fail silently
+via the crash-handling path, producing thousands of bogus "IdealSimTimeout"
+rows. If a training log shows >5% crash rate or a flat ~0.13 fidelity
+floor, verify `conda env list` / `which python` first.
 
 ## Related Commits (chronological)
 

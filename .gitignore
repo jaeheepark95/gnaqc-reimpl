@@ -26,3 +26,7 @@ Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
+
+# paper
+*.pdf
+paper_extract/
