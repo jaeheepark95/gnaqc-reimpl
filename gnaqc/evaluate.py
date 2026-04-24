@@ -1,7 +1,7 @@
 """Evaluation script for GNAQC.
 
-Compares GNAQC layouts against 4 baseline methods (trivial, dense, noise_adaptive, sabre)
-using BOTH Hellinger fidelity (paper's metric) and PST (common in qubit-mapping literature).
+Compares GNAQC layouts against the SABRE baseline using BOTH Hellinger fidelity
+(paper's metric) and PST (common in qubit-mapping literature).
 
 Usage:
     python -m gnaqc.evaluate \
@@ -32,7 +32,7 @@ from gnaqc.train import load_training_circuits
 logger = logging.getLogger(__name__)
 
 # Baseline layout methods available in Qiskit
-BASELINE_METHODS = ["trivial", "dense", "noise_adaptive", "sabre"]
+BASELINE_METHODS = ["sabre"]
 
 
 def evaluate_gnaqc_layout(
@@ -75,8 +75,8 @@ def evaluate_gnaqc_layout(
         seed_transpiler=cfg.seed_transpiler,
     )
 
-    ideal_sim = create_ideal_simulator(backend)
-    noisy_sim = create_noisy_simulator(backend)
+    ideal_sim = create_ideal_simulator(backend, sim_method=cfg.sim_method)
+    noisy_sim = create_noisy_simulator(backend, sim_method=cfg.sim_method)
     ideal_counts = ideal_sim.run(compiled, shots=cfg.eval_shots).result().get_counts()
     noisy_counts = noisy_sim.run(compiled, shots=cfg.eval_shots).result().get_counts()
     hellinger = compute_hellinger_fidelity(ideal_counts, noisy_counts)
@@ -110,8 +110,8 @@ def evaluate_baseline_layout(
         seed_transpiler=cfg.seed_transpiler,
     )
 
-    ideal_sim = create_ideal_simulator(backend)
-    noisy_sim = create_noisy_simulator(backend)
+    ideal_sim = create_ideal_simulator(backend, sim_method=cfg.sim_method)
+    noisy_sim = create_noisy_simulator(backend, sim_method=cfg.sim_method)
     ideal_counts = ideal_sim.run(compiled, shots=cfg.eval_shots).result().get_counts()
     noisy_counts = noisy_sim.run(compiled, shots=cfg.eval_shots).result().get_counts()
     hellinger = compute_hellinger_fidelity(ideal_counts, noisy_counts)
@@ -207,6 +207,11 @@ def evaluate(
             pivot = df.pivot_table(index="circuit", columns="method", values=metric).round(4)
             logger.info(f"\n=== Per-circuit {metric} ===\n{pivot.to_string()}")
 
+        from gnaqc.visualize_eval import visualize
+        written = visualize(csv_path, output_dir)
+        for key, path in written.items():
+            logger.info(f"{key} -> {path}")
+
     return df
 
 
@@ -220,6 +225,9 @@ def main():
                         help="Evaluation shots (default 8192, aligned with GraphQMap)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument("--sim-method", type=str, default="statevector",
+                        choices=["tensor_network", "statevector", "matrix_product_state"],
+                        help="AerSimulator method. Match training for meaningful comparison.")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -228,6 +236,7 @@ def main():
         eval_shots=args.shots,
         seed_transpiler=args.seed,
         noise_perturb_enabled=False,
+        sim_method=args.sim_method,
     )
     evaluate(
         checkpoint_path=args.checkpoint,

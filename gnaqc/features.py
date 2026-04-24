@@ -16,6 +16,7 @@ from qiskit.circuit import Measure
 from qiskit.transpiler import PassManager
 from qiskit.transpiler.passes import (
     BasisTranslator,
+    HighLevelSynthesis,
     Unroll3qOrMore,
 )
 from qiskit.circuit.equivalence_library import SessionEquivalenceLibrary
@@ -217,6 +218,10 @@ def get_intermediate_circuit(circuit: QuantumCircuit, backend) -> QuantumCircuit
     basis_gates = backend.configuration().basis_gates
 
     pm = PassManager()
+    # HighLevelSynthesis converts MCX and other high-level gates to 1/2-qubit
+    # gates before Unroll3qOrMore runs. Without it, MCX(n>=4) decomposes into
+    # UnitaryGate objects that BasisTranslator cannot translate.
+    pm.append(HighLevelSynthesis())
     pm.append(Unroll3qOrMore())
     pm.append(BasisTranslator(SessionEquivalenceLibrary, basis_gates))
     return pm.run(circuit)

@@ -35,7 +35,7 @@ from gnaqc.features import (
 from gnaqc.fidelity import compute_hellinger_fidelity
 from gnaqc.noise_perturbation import perturb_backend_noise
 from gnaqc.sim_worker import SimWorker, SimWorkerTimeout
-from gnaqc.simulator import _SIM_CONFIG
+from gnaqc.simulator import _sim_kwargs
 
 
 def ensure_measurements(circuit: QuantumCircuit) -> QuantumCircuit:
@@ -84,7 +84,7 @@ class QubitAllocationEnv:
         # Persistent subprocess worker for all AerSimulator calls — gives us
         # OS-level kill semantics for cuTensorNet hangs that survive in-process
         # timeouts.
-        self._sim_worker = SimWorker(sim_config=dict(_SIM_CONFIG))
+        self._sim_worker = SimWorker(sim_config=_sim_kwargs(cfg.sim_method))
 
         # Noise RNG (reproducible across episodes)
         if cfg.noise_perturb_enabled:

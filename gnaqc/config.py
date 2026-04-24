@@ -19,7 +19,9 @@ class GNAQCConfig:
     combined_hidden: int = 256          # [standard]
 
     # === RL ===
-    epsilon: float = 0.05               # [paper] Section V-A: Epsilon-Greedy epsilon=0.05
+    epsilon: float = 0.05               # [paper] Section V-A: final (or fixed) epsilon
+    eps_start: float = 0.05            # initial epsilon; if > epsilon, linear decay is applied
+    eps_decay_episodes: int = 0        # episodes to decay from eps_start → epsilon (0 = no decay)
     gamma: float = 0.99                 # [standard] discount factor
     lr: float = 1e-3                    # [standard]
     replay_buffer_size: int = 10000     # [standard]
@@ -44,6 +46,11 @@ class GNAQCConfig:
     # margin for the pathological-contraction-path case where cuTensorNet's
     # autotuner picks a plan that runs for many minutes without crashing.
     train_sim_timeout_s: float = 120.0
+    # AerSimulator method. "tensor_network" is the only feasible option for
+    # Rochester (53Q, statevector would need 2^53 amplitudes). For Toronto
+    # (27Q) or smaller, "statevector" on GPU is typically 2-10x faster and
+    # eliminates cuTensorNet contractor crashes.
+    sim_method: str = "statevector"
     routing_method: str = "sabre"       # [paper] Qiskit default routing
     seed_transpiler: int = 42           # deterministic routing for reproducibility
 

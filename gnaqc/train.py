@@ -12,6 +12,7 @@ References:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
 import os
@@ -106,17 +107,24 @@ def load_training_circuits(
     circuit_dir: str = "circuits",
     circuit_names: list[str] | None = None,
 ) -> list[tuple[str, QuantumCircuit]]:
-    """Load benchmark circuits from QASM files, filtered by the 25 Pozzi set.
+    """Load benchmark circuits from QASM files.
+
+    When circuit_names is None:
+      - circuit_dir == "circuits": uses the fixed BENCHMARK_CIRCUITS list (25 Pozzi)
+      - any other directory: auto-discovers all *.qasm files in that directory
 
     Args:
         circuit_dir: Directory containing <name>.qasm files.
-        circuit_names: Specific circuits to load (defaults to BENCHMARK_CIRCUITS).
+        circuit_names: Specific circuits to load. None = auto-select by directory.
 
     Returns:
         List of (name, QuantumCircuit) in the order of `circuit_names`.
     """
     if circuit_names is None:
-        circuit_names = BENCHMARK_CIRCUITS
+        if circuit_dir == "circuits":
+            circuit_names = BENCHMARK_CIRCUITS
+        else:
+            circuit_names = sorted(p.stem for p in Path(circuit_dir).glob("*.qasm"))
 
     circuits: list[tuple[str, QuantumCircuit]] = []
     circuit_path = Path(circuit_dir)
@@ -197,12 +205,19 @@ def _generate_default_circuits() -> list[tuple[str, QuantumCircuit]]:
 # Training
 # ---------------------------------------------------------------------------
 
-def train(cfg: GNAQCConfig, run_dir: str | None = None):
+def train(
+    cfg: GNAQCConfig,
+    run_dir: str | None = None,
+    circuit_dir: str = "circuits",
+    resume: bool = False,
+):
     """Run GNAQC DQN training.
 
     Args:
         cfg: Training configuration.
         run_dir: Directory for saving checkpoints and logs.
+        circuit_dir: Directory containing .qasm benchmark circuits.
+        resume: If True, resume from existing checkpoints in run_dir.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
@@ -214,7 +229,7 @@ def train(cfg: GNAQCConfig, run_dir: str | None = None):
     os.makedirs(run_dir, exist_ok=True)
     os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
 
-    # Save config
+    # Save config (overwrite on resume to reflect any updated num_episodes)
     with open(f"{run_dir}/config.json", "w") as f:
         json.dump(cfg.__dict__, f, indent=2, default=str)
 
@@ -225,12 +240,24 @@ def train(cfg: GNAQCConfig, run_dir: str | None = None):
     logger.info(f"Loaded backends: {list(backends.keys())}")
 
     # Load circuits
-    circuits = load_training_circuits()
+    circuits = load_training_circuits(circuit_dir)
 
     # Train per-backend (paper trains separate models for 7Q and 27Q)
     for be_name, be in backends.items():
         num_physical = be.target.num_qubits
-        _train_single_backend(cfg, be_name, be, num_physical, circuits, device, run_dir)
+        resume_ckpt: str | None = None
+        if resume:
+            candidate = Path(run_dir) / "checkpoints" / f"{be_name}_resume.pt"
+            if candidate.exists():
+                resume_ckpt = str(candidate)
+            else:
+                logger.warning(
+                    f"Resume checkpoint not found: {candidate}. Starting from scratch."
+                )
+        _train_single_backend(
+            cfg, be_name, be, num_physical, circuits, device, run_dir,
+            resume_checkpoint=resume_ckpt,
+        )
 
 
 def _train_single_backend(
@@ -241,6 +268,7 @@ def _train_single_backend(
     circuits: list[tuple[str, QuantumCircuit]],
     device: torch.device,
     run_dir: str,
+    resume_checkpoint: str | None = None,
 ):
     """Train GNAQC on a single backend."""
     logger.info(f"\n{'='*60}")
@@ -267,17 +295,44 @@ def _train_single_backend(
     env = QubitAllocationEnv(cfg, device)
     replay_buffer = ReplayBuffer(cfg.replay_buffer_size)
 
-    # Metrics tracking
-    episode_rewards = []
-    episode_fidelities = []
+    # Metrics tracking — optionally restored from checkpoint
+    start_episode = 0
+    episode_rewards: list[float] = []
+    episode_fidelities: list[float] = []
     best_avg_fidelity = 0.0
-    log_file = open(f"{run_dir}/{backend_name}_training_log.csv", "w")
-    log_file.write("episode,total_reward,terminal_fidelity,loss,epsilon\n")
-    crash_file = open(f"{run_dir}/{backend_name}_crashes.csv", "w")
-    crash_file.write("episode,circuit,num_logical,layout,error_type,error\n")
     num_crashes = 0
 
-    for episode in range(cfg.num_episodes):
+    if resume_checkpoint:
+        ckpt = torch.load(resume_checkpoint, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        target_model.load_state_dict(ckpt["target_model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        start_episode = ckpt["episode"] + 1
+        best_avg_fidelity = ckpt["best_avg_fidelity"]
+        episode_rewards = list(ckpt.get("episode_rewards_tail", []))
+        episode_fidelities = list(ckpt.get("episode_fidelities_tail", []))
+        logger.info(
+            f"[{backend_name}] Resumed from episode {start_episode} "
+            f"(best_avg_fidelity={best_avg_fidelity:.4f})"
+        )
+
+    log_mode = "a" if resume_checkpoint else "w"
+    log_file = open(f"{run_dir}/{backend_name}_training_log.csv", log_mode)
+    if not resume_checkpoint:
+        log_file.write("episode,total_reward,terminal_fidelity,loss,epsilon\n")
+    crash_file = open(f"{run_dir}/{backend_name}_crashes.csv", log_mode)
+    if not resume_checkpoint:
+        crash_file.write("episode,circuit,num_logical,layout,error_type,error\n")
+
+    for episode in range(start_episode, cfg.num_episodes):
+        # Linear epsilon decay: eps_start → epsilon over eps_decay_episodes.
+        # After decay period, epsilon stays at cfg.epsilon (the floor).
+        if cfg.eps_decay_episodes > 0 and cfg.eps_start > cfg.epsilon:
+            progress = min(episode / cfg.eps_decay_episodes, 1.0)
+            current_eps = cfg.eps_start + (cfg.epsilon - cfg.eps_start) * progress
+        else:
+            current_eps = cfg.epsilon
+
         circ_name, circ = random.choice(valid_circuits)
         state = env.reset(circ, backend, backend_name)
         total_reward = 0.0
@@ -289,7 +344,7 @@ def _train_single_backend(
             # paper MDP's 0-reward learning signal on invalid picks; under
             # "mask" mode we restrict both random and greedy choices to valid.
             zero_reward_mode = cfg.invalid_action_mode == "zero_reward"
-            if random.random() < cfg.epsilon:
+            if random.random() < current_eps:
                 if zero_reward_mode:
                     N = env.num_physical
                     action = random.randrange(N * N)
@@ -369,7 +424,7 @@ def _train_single_backend(
         episode_rewards.append(total_reward)
         episode_fidelities.append(terminal_fidelity)
 
-        log_file.write(f"{episode},{total_reward:.4f},{terminal_fidelity:.4f},{episode_loss:.6f},{cfg.epsilon}\n")
+        log_file.write(f"{episode},{total_reward:.4f},{terminal_fidelity:.4f},{episode_loss:.6f},{current_eps:.4f}\n")
 
         # Periodic target network update
         if (episode + 1) % cfg.target_update_freq == 0:
@@ -394,6 +449,21 @@ def _train_single_backend(
                 )
                 logger.info(f"  New best avg fidelity: {best_avg_fidelity:.4f}")
 
+            # Resume checkpoint: full training state so training can be interrupted
+            # and continued with --resume without losing optimizer state or progress.
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "target_model": target_model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "episode": episode,
+                    "best_avg_fidelity": best_avg_fidelity,
+                    "episode_rewards_tail": episode_rewards[-100:],
+                    "episode_fidelities_tail": episode_fidelities[-100:],
+                },
+                f"{run_dir}/checkpoints/{backend_name}_resume.pt",
+            )
+
         if (episode + 1) % 1000 == 0:
             torch.save(
                 model.state_dict(),
@@ -417,12 +487,36 @@ def _train_single_backend(
 
 def main():
     parser = argparse.ArgumentParser(description="Train GNAQC")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Resume training from an existing run directory. "
+                             "Config is restored from that run; use --episodes to extend "
+                             "beyond the original total (e.g. --episodes 7000 to add 2000 more).")
     parser.add_argument("--backends", nargs="+", default=["toronto", "rochester"],
                         help="Backend names (e.g. toronto rochester)")
-    parser.add_argument("--episodes", type=int, default=5000)
+    parser.add_argument("--episodes", type=int, default=None,
+                        help="Total number of training episodes. Defaults to 5000 for new runs, "
+                             "or the saved value when resuming.")
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--epsilon", type=float, default=0.05)
+    parser.add_argument("--epsilon", type=float, default=0.05,
+                        help="Final (floor) epsilon for ε-greedy (default 0.05)")
+    parser.add_argument("--eps-start", type=float, default=0.05,
+                        help="Initial epsilon for ε-decay. If > --epsilon, linear decay is applied "
+                             "from eps-start down to epsilon over --eps-decay-episodes steps.")
+    parser.add_argument("--eps-decay-episodes", type=int, default=0,
+                        help="Episodes over which to decay epsilon from eps-start to epsilon "
+                             "(0 = no decay, fixed epsilon)")
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--target-update-freq", type=int, default=100,
+                        help="Episodes between target network sync (default 100)")
+    parser.add_argument("--flat-reward", type=float, default=10.0,
+                        help="Per-placement flat reward (paper=10.0; set to 0.0 for terminal-only)")
+    parser.add_argument("--sim-method", type=str, default="statevector",
+                        choices=["tensor_network", "statevector", "matrix_product_state"],
+                        help="AerSimulator method. 'statevector' recommended for Toronto (27Q); "
+                             "'tensor_network' required for Rochester (53Q).")
+    parser.add_argument("--sim-timeout", type=float, default=120.0,
+                        help="Per-simulation timeout in seconds (default 120). "
+                             "Reduce to 30 when using statevector — normal sims finish in <10s.")
     parser.add_argument("--gnn-hidden", type=int, default=64)
     parser.add_argument("--train-shots", type=int, default=1000,
                         help="Shots for per-episode noisy simulation (lower = faster)")
@@ -452,26 +546,46 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    cfg = GNAQCConfig(
-        backends=args.backends,
-        num_episodes=args.episodes,
-        lr=args.lr,
-        epsilon=args.epsilon,
-        batch_size=args.batch_size,
-        gnn_hidden=args.gnn_hidden,
-        train_shots=args.train_shots,
-        noise_perturb_enabled=not args.no_noise_perturb,
-        normalize_circuit_partners=not args.no_normalize_partners,
-        edge_self_loops=args.edge_self_loops,
-        invalid_action_mode=args.invalid_action_mode,
-    )
-    cfg._max_circuit_qubits = args.max_circuit_qubits  # consumed in _train_single_backend
+    resume = args.resume is not None
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name_suffix = f"_{args.name}" if args.name else ""
-    run_dir = f"runs/{timestamp}{name_suffix}"
+    if resume:
+        run_dir = args.resume
+        with open(f"{run_dir}/config.json") as f:
+            saved = json.load(f)
+        cfg_fields = {field.name for field in dataclasses.fields(GNAQCConfig)}
+        cfg = GNAQCConfig(**{k: v for k, v in saved.items() if k in cfg_fields})
+        cfg._max_circuit_qubits = saved.get("_max_circuit_qubits", 0)
+        if args.episodes is not None:
+            cfg.num_episodes = args.episodes
+        logger.info(
+            f"Resuming run: {run_dir} (total episodes: {cfg.num_episodes})"
+        )
+    else:
+        cfg = GNAQCConfig(
+            backends=args.backends,
+            num_episodes=args.episodes if args.episodes is not None else 5000,
+            lr=args.lr,
+            epsilon=args.epsilon,
+            eps_start=args.eps_start,
+            eps_decay_episodes=args.eps_decay_episodes,
+            batch_size=args.batch_size,
+            target_update_freq=args.target_update_freq,
+            flat_reward=args.flat_reward,
+            sim_method=args.sim_method,
+            train_sim_timeout_s=args.sim_timeout,
+            gnn_hidden=args.gnn_hidden,
+            train_shots=args.train_shots,
+            noise_perturb_enabled=not args.no_noise_perturb,
+            normalize_circuit_partners=not args.no_normalize_partners,
+            edge_self_loops=args.edge_self_loops,
+            invalid_action_mode=args.invalid_action_mode,
+        )
+        cfg._max_circuit_qubits = args.max_circuit_qubits
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        name_suffix = f"_{args.name}" if args.name else ""
+        run_dir = f"runs/{timestamp}{name_suffix}"
 
-    train(cfg, run_dir)
+    train(cfg, run_dir, circuit_dir=args.circuit_dir, resume=resume)
 
 
 if __name__ == "__main__":
